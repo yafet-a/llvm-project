@@ -175,8 +175,8 @@ def N2Write_2c_1L01_1V : SchedWriteRes<[N2UnitL01, N2UnitV]> {
   let NumMicroOps = 2;
 }
 
-def N2Write_4c_1V1_1V : SchedWriteRes<[N2UnitV1, N2UnitV]> {
-  let Latency     = 4;
+def N2Write_5c_1V1_1V : SchedWriteRes<[N2UnitV1, N2UnitV]> {
+  let Latency     = 5;
   let NumMicroOps = 2;
 }
 
@@ -291,11 +291,6 @@ def N2Write_6c_1L_1S : SchedWriteRes<[N2UnitL, N2UnitS]> {
 
 def N2Write_9c_1L_1V : SchedWriteRes<[N2UnitL, N2UnitV]> {
   let Latency     = 9;
-  let NumMicroOps = 2;
-}
-
-def N2Write_4c_2V1 : SchedWriteRes<[N2UnitV1, N2UnitV1]> {
-  let Latency     = 4;
   let NumMicroOps = 2;
 }
 
@@ -1006,14 +1001,14 @@ def : InstRW<[N2Write_4c_1V1],
              (instregex "^SABAv", "^UABAv", "^SABALv", "^UABALv")>;
 
 // ASIMD arith, reduce, 4H/4S
-def : InstRW<[N2Write_2c_1V1], (instregex "^(ADDV|[SU]ADDLV)v4(i16|i32)v$")>;
+def : InstRW<[N2Write_3c_1V1], (instregex "^(ADDV|[SU]ADDLV)v4(i16|i32)v$")>;
 
 // ASIMD arith, reduce, 8B/8H
-def : InstRW<[N2Write_4c_1V1_1V],
+def : InstRW<[N2Write_5c_1V1_1V],
              (instregex "^(ADDV|[SU]ADDLV)v8(i8|i16)v$")>;
 
 // ASIMD arith, reduce, 16B
-def : InstRW<[N2Write_4c_1V1], (instrs ADDVv16i8v, SADDLVv16i8v,
+def : InstRW<[N2Write_6c_1V1], (instrs ADDVv16i8v, SADDLVv16i8v,
                                        UADDLVv16i8v)>;
 
 // ASIMD dot product
@@ -1025,15 +1020,15 @@ def : InstRW<[N2Write_3c_1V],
 def : InstRW<[N2Write_3c_1V], (instrs SMMLA, UMMLA, USMMLA)>;
 
 // ASIMD max/min, reduce, 4H/4S
-def : InstRW<[N2Write_2c_1V1], (instregex "^[SU](MAX|MIN)Vv4i16v$",
+def : InstRW<[N2Write_3c_1V1], (instregex "^[SU](MAX|MIN)Vv4i16v$",
                                           "^[SU](MAX|MIN)Vv4i32v$")>;
 
 // ASIMD max/min, reduce, 8B/8H
-def : InstRW<[N2Write_4c_1V1_1V], (instregex "^[SU](MAX|MIN)Vv8i8v$",
+def : InstRW<[N2Write_5c_1V1_1V], (instregex "^[SU](MAX|MIN)Vv8i8v$",
                                              "^[SU](MAX|MIN)Vv8i16v$")>;
 
 // ASIMD max/min, reduce, 16B
-def : InstRW<[N2Write_4c_2V1], (instregex "[SU](MAX|MIN)Vv16i8v$")>;
+def : InstRW<[N2Write_6c_2V1], (instregex "[SU](MAX|MIN)Vv16i8v$")>;
 
 // ASIMD multiply
 def : InstRW<[N2Write_4c_1V0], (instregex "^MULv", "^SQ(R)?DMULHv")>;

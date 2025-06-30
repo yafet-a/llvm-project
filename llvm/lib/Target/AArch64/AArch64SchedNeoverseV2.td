@@ -157,6 +157,7 @@ def V2Write_20c_1V0  : SchedWriteRes<[V2UnitV0]>  { let Latency = 20;
 def V2Write_2c_1V1   : SchedWriteRes<[V2UnitV1]>  { let Latency = 2; }
 def V2Write_2c_1V13  : SchedWriteRes<[V2UnitV13]> { let Latency = 2; }
 def V2Write_3c_1V1   : SchedWriteRes<[V2UnitV1]>  { let Latency = 3; }
+def V2Write_3c_1V13  : SchedWriteRes<[V2UnitV13]> { let Latency = 3; }
 def V2Write_4c_1V1   : SchedWriteRes<[V2UnitV1]>  { let Latency = 4; }
 def V2Write_4c_1V13  : SchedWriteRes<[V2UnitV13]> { let Latency = 4; }
 def V2Write_6c_1V1   : SchedWriteRes<[V2UnitV1]>  { let Latency = 6; }
@@ -258,6 +259,11 @@ def V2Write_4c_1L01_1V01  : SchedWriteRes<[V2UnitL01, V2UnitV01]> {
 
 def V2Write_4c_1V13_1V : SchedWriteRes<[V2UnitV13, V2UnitV]> {
   let Latency     = 4;
+  let NumMicroOps = 2;
+}
+
+def V2Write_5c_1V13_1V : SchedWriteRes<[V2UnitV13, V2UnitV]> {
+  let Latency     = 5;
   let NumMicroOps = 2;
 }
 
@@ -378,6 +384,11 @@ def V2Write_6c_1L_1S : SchedWriteRes<[V2UnitL, V2UnitS]> {
 
 def V2Write_4c_2V13 : SchedWriteRes<[V2UnitV13, V2UnitV13]> {
   let Latency     = 4;
+  let NumMicroOps = 2;
+}
+
+def V2Write_6c_2V13 : SchedWriteRes<[V2UnitV13, V2UnitV13]> {
+  let Latency     = 6;
   let NumMicroOps = 2;
 }
 
@@ -1468,14 +1479,14 @@ def : SchedAlias<WriteVq, V2Write_2c_1V>;
 def : InstRW<[V2Wr_VA, V2Rd_VA], (instregex "^[SU]ABAL?v")>;
 
 // ASIMD arith, reduce, 4H/4S
-def : InstRW<[V2Write_2c_1V13], (instregex "^(ADDV|[SU]ADDLV)v4(i16|i32)v$")>;
+def : InstRW<[V2Write_3c_1V13], (instregex "^(ADDV|[SU]ADDLV)v4(i16|i32)v$")>;
 
 // ASIMD arith, reduce, 8B/8H
-def : InstRW<[V2Write_4c_1V13_1V],
+def : InstRW<[V2Write_5c_1V13_1V],
              (instregex "^(ADDV|[SU]ADDLV)v8(i8|i16)v$")>;
 
 // ASIMD arith, reduce, 16B
-def : InstRW<[V2Write_4c_2V13], (instregex "^(ADDV|[SU]ADDLV)v16i8v$")>;
+def : InstRW<[V2Write_6c_2V13], (instregex "^(ADDV|[SU]ADDLV)v16i8v$")>;
 
 // ASIMD dot product
 // ASIMD dot product using signed and unsigned integers
