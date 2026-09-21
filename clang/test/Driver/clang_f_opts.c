@@ -63,10 +63,15 @@
 // INTERCHANGE-OFF-NOT: loop-interchange
 
 // RUN: %clang -### -S -fexperimental-loop-fusion %s -o /dev/null 2>&1 | FileCheck -check-prefix=CHECK-FUSE-LOOPS %s
+// RUN: %clang -### -S -fno-experimental-loop-fusion %s -o /dev/null 2>&1 | FileCheck -check-prefix=CHECK-NO-FUSE-LOOPS %s
 // CHECK-FUSE-LOOPS: "-fexperimental-loop-fusion"
+// CHECK-NO-FUSE-LOOPS: "-fno-experimental-loop-fusion"
 //
+// Loop fusion is enabled by default only at -O3.
 // RUN: %clang -c -fexperimental-loop-fusion -mllvm -print-pipeline-passes -O3 %s -o /dev/null 2>&1 | FileCheck --check-prefixes=LOOP-FUSION-ON %s
-// RUN: %clang -c -mllvm -print-pipeline-passes -O3 %s -o /dev/null 2>&1 | FileCheck --check-prefixes=LOOP-FUSION-OFF %s
+// RUN: %clang -c -mllvm -print-pipeline-passes -O3 %s -o /dev/null 2>&1 | FileCheck --check-prefixes=LOOP-FUSION-ON %s
+// RUN: %clang -c -mllvm -print-pipeline-passes -O2 %s -o /dev/null 2>&1 | FileCheck --check-prefixes=LOOP-FUSION-OFF %s
+// RUN: %clang -c -fno-experimental-loop-fusion -mllvm -print-pipeline-passes -O3 %s -o /dev/null 2>&1 | FileCheck --check-prefixes=LOOP-FUSION-OFF %s
 
 // LOOP-FUSION-ON: loop-fusion
 // LOOP-FUSION-OFF-NOT: loop-fusion

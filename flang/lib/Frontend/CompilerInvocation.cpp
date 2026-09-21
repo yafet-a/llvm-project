@@ -327,8 +327,10 @@ static void parseCodeGenArgs(Fortran::frontend::CodeGenOptions &opts,
       args.hasFlag(clang::options::OPT_floop_interchange,
                    clang::options::OPT_fno_loop_interchange, true);
 
-  if (args.getLastArg(clang::options::OPT_fexperimental_loop_fusion))
-    opts.FuseLoops = 1;
+  opts.FuseLoops =
+      args.hasFlag(clang::options::OPT_fexperimental_loop_fusion,
+                   clang::options::OPT_fno_experimental_loop_fusion,
+                   opts.OptimizationLevel == 3);
 
   if (args.getLastArg(clang::options::OPT_vectorize_loops))
     opts.VectorizeLoop = 1;
