@@ -1287,6 +1287,12 @@ static bool runImpl(Function &F, const TargetLowering &TLI,
   if (ExpandDivRemBits != IntegerType::MAX_INT_BITS)
     MaxLegalDivRemBitWidth = ExpandDivRemBits;
 
+  // MSVC's ARM64 CRT has no 128-bit div/rem routines; expand them inline.
+  const Triple &TT = F.getParent()->getTargetTriple();
+  if (TT.isAArch64() && TT.isWindowsMSVCEnvironment() &&
+      !TT.isWindowsArm64EC() && MaxLegalDivRemBitWidth > 64)
+    MaxLegalDivRemBitWidth = 64;
+
   bool DisableExpandLargeFp =
       MaxLegalFpConvertBitWidth >= IntegerType::MAX_INT_BITS;
   bool DisableExpandLargeDivRem =
