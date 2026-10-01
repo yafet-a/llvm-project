@@ -203,6 +203,9 @@ static BinaryOperator *isFMulAddCandidate(Value *V) {
       isa<Constant>(OtherOp) || isReassociableOp(OtherOp, Instruction::FAdd) ||
       match(OtherOp, m_AllowContract(m_FMul(m_Value(), m_Value()))))
     return nullptr;
+  // Keep square multiplies visible to the surrounding expression.
+  if (Mul->getOperand(0) == Mul->getOperand(1))
+    return nullptr;
   return Mul;
 }
 
