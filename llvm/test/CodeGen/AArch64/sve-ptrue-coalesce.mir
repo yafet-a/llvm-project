@@ -924,3 +924,44 @@ body:             |
     RET_ReallyLR
 
 ...
+
+
+---
+name:            keep_ptrue_s_when_dom_is_b_for_s_user
+alignment:       2
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: zpr }
+  - { id: 1, class: zpr }
+  - { id: 2, class: ppr_3b }
+  - { id: 3, class: ppr_3b }
+  - { id: 4, class: ppr }
+  - { id: 5, class: ppr }
+liveins:
+  - { reg: '$z0', virtual-reg: '%0' }
+  - { reg: '$z1', virtual-reg: '%1' }
+body:             |
+  bb.0:
+    liveins: $z0, $z1
+
+    ; ENABLED-LABEL: name: keep_ptrue_s_when_dom_is_b_for_s_user
+    ; ENABLED: [[COPY:%[0-9]+]]:zpr = COPY $z0
+    ; ENABLED-NEXT: [[COPY1:%[0-9]+]]:zpr = COPY $z1
+    ; ENABLED-NEXT: [[PTRUE_B:%[0-9]+]]:ppr_3b = PTRUE_B 31, implicit $vg
+    ; ENABLED-NEXT: [[PTRUE_S:%[0-9]+]]:ppr_3b = PTRUE_S 31, implicit $vg
+    ; ENABLED-NEXT: [[CMPEQ_B:%[0-9]+]]:ppr = CMPEQ_PPzZZ_B [[PTRUE_B]], [[COPY]], [[COPY1]], implicit-def dead $nzcv
+    ; ENABLED-NEXT: [[FCMNE_S:%[0-9]+]]:ppr = nofpexcept FCMNE_PPzZ0_S [[PTRUE_S]], [[COPY1]]
+    ; ENABLED-NEXT: RET_ReallyLR
+    ;
+    ; DISABLED-LABEL: name: keep_ptrue_s_when_dom_is_b_for_s_user
+    ; DISABLED: [[PTRUE_B:%[0-9]+]]:ppr_3b = PTRUE_B 31, implicit $vg
+    ; DISABLED-NEXT: [[PTRUE_S:%[0-9]+]]:ppr_3b = PTRUE_S 31, implicit $vg
+    %0:zpr = COPY $z0
+    %1:zpr = COPY $z1
+    %2:ppr_3b = PTRUE_B 31, implicit $vg
+    %3:ppr_3b = PTRUE_S 31, implicit $vg
+    %4:ppr = CMPEQ_PPzZZ_B %2, %0, %1, implicit-def dead $nzcv
+    %5:ppr = nofpexcept FCMNE_PPzZ0_S %3, %1
+    RET_ReallyLR
+
+...

@@ -178,6 +178,11 @@ bool AArch64PTrueCoalescingImpl::tryCoalesce(PredicateInfo &DomPI,
 
   Register DomReg = DomMI->getOperand(0).getReg();
   Register CanReg = CanMI->getOperand(0).getReg();
+  if (!MutateDomPTrue && DomPI.ElementSize == AArch64::ElementSizeB &&
+      CanPI.ElementSize == AArch64::ElementSizeS)
+    for (MachineOperand &UseMO : MRI->use_nodbg_operands(CanReg))
+      if (TII->getName(UseMO.getParent()->getOpcode()).starts_with("FCM"))
+        return false;
   if (!MRI->constrainRegClass(DomReg, MRI->getRegClass(CanReg)))
     return false;
 
