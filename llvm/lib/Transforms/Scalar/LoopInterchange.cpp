@@ -26,6 +26,7 @@
 #include "llvm/Analysis/LoopPass.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionDivision.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/DiagnosticInfo.h"
@@ -35,6 +36,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/User.h"
 #include "llvm/IR/Value.h"
 #include "llvm/IR/Verifier.h"
@@ -61,6 +63,16 @@ STATISTIC(LoopsInterchanged, "Number of loops interchanged");
 static cl::opt<int> LoopInterchangeCostThreshold(
     "loop-interchange-threshold", cl::init(0), cl::Hidden,
     cl::desc("Interchange if you gain more than this number"));
+
+// Allow a simple, inner-loop-invariant load to sit between the two loops of a
+// candidate nest (an "almost tightly nested" loop). Memory-safety of moving it
+// across the interchange is already guaranteed by the dependence matrix, which
+// analyzes every memory operation in the nest. Gated while the transform's
+// re-homing of such instructions is validated.
+static cl::opt<bool> AllowInnerLoopInvariantLoads(
+    "loop-interchange-allow-inner-invariant-loads", cl::init(false), cl::Hidden,
+    cl::desc("Permit an inner-loop-invariant load between the loops of a "
+             "candidate nest (almost tightly nested)."));
 
 static cl::opt<unsigned int> MaxMemInstrRatio(
     "loop-interchange-max-mem-instr-ratio", cl::init(4), cl::Hidden,
@@ -242,7 +254,14 @@ static bool populateDependencyMatrix(CharMatrix &DepMatrix, unsigned Level,
                           << " Src:" << *Src << "\n Dst:" << *Dst << '\n');
         unsigned Levels = D->getLevels();
         char Direction;
-        for (unsigned II = 1; II <= Levels; ++II) {
+        // Dependence levels are numbered from the outermost loop enclosing both
+        // accesses, while a row of the matrix describes only the loops under
+        // consideration. Start reading at the depth of the outermost of those,
+        // so that a nest sitting inside other loops is described by its own
+        // levels rather than by the ones above it. Without this a row could be
+        // longer than the nest, which the padding below cannot then shorten.
+        unsigned Base = L->getLoopDepth();
+        for (unsigned II = Base; II <= Levels && II < Base + Level; ++II) {
           // `DVEntry::LE` is converted to `*`. This is because `LE` means `<`
           // or `=`, for which we don't have an equivalent representation, so
           // that the conservative approximation is necessary. The same goes for
@@ -265,18 +284,12 @@ static bool populateDependencyMatrix(CharMatrix &DepMatrix, unsigned Level,
         // dependency vector with '*'.
         if (D->isConfused()) {
           assert(Dep.empty() && "Expected empty dependency vector");
-          Dep.assign(L->getLoopDepth() + Level - 1, '*');
+          Dep.assign(Level, '*');
         }
 
-        while (Dep.size() < L->getLoopDepth() + Level - 1) {
+        while (Dep.size() < Level) {
           Dep.push_back('I');
         }
-
-        // Dependence analysis reports levels for the full enclosing loop nest.
-        // Keep only the suffix that corresponds to the selected perfect
-        // subnest.
-        if (Dep.size() > Level)
-          Dep.erase(Dep.begin(), Dep.end() - Level);
 
         // If all the elements of any direction vector have only '*', legality
         // can't be proven. Exit early to save compile time.
@@ -514,7 +527,8 @@ public:
 
 private:
   bool tightlyNested(Loop *Outer, Loop *Inner);
-  bool containsUnsafeInstructions(BasicBlock *BB, Instruction *Skip);
+  bool containsUnsafeInstructions(BasicBlock *BB, Instruction *Skip,
+                                  bool AllowInvariantLoads = false);
 
   /// Traverse all PHI nodes in the header of each loop in the loop nest
   /// starting from \p OuterLoop, and perform the following checks:
@@ -864,11 +878,26 @@ struct LoopInterchange {
 
 } // end anonymous namespace
 
-bool LoopInterchangeLegality::containsUnsafeInstructions(BasicBlock *BB,
-                                                         Instruction *Skip) {
-  return any_of(*BB, [Skip](const Instruction &I) {
+bool LoopInterchangeLegality::containsUnsafeInstructions(
+    BasicBlock *BB, Instruction *Skip, bool AllowInvariantLoads) {
+  return any_of(*BB, [Skip, AllowInvariantLoads, this](const Instruction &I) {
     if (&I == Skip)
       return false;
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      if (II->getIntrinsicID() == Intrinsic::assume)
+        return false;
+    // A simple load whose address is invariant in the inner loop can sit
+    // between the loops: reordering it across the interchange is already
+    // vouched for by the dependence matrix (which analyzes every memory op in
+    // the nest), and the transform re-homes it. Allowing it lets a nest like
+    //   a(i,k,j) = mu(i,j) * a(i,k,j)
+    // interchange, where LICM hoisted mu(i,j) (invariant in the inner loop)
+    // into the outer loop body.
+    if (AllowInvariantLoads)
+      if (const auto *LI = dyn_cast<LoadInst>(&I))
+        if (LI->isSimple() &&
+            InnerLoop->isLoopInvariant(LI->getPointerOperand()))
+          return false;
     return I.mayHaveSideEffects() || I.mayReadFromMemory();
   });
 }
@@ -973,17 +1002,26 @@ bool LoopInterchangeLegality::tightlyNested(Loop *OuterLoop, Loop *InnerLoop) {
   if (InnerReductions.size() == 1)
     Skip = InnerReductions[0].LcssaStore;
 
+  // Only relax the "no memory op between the loops" rule for a clean two-deep
+  // nest whose outer loop's sole child is the inner loop. Deeper or branching
+  // structure is left strict, so downstream passes that assume a simple chain
+  // (e.g. checkInductionsAndReductions) are not fed a nest they cannot handle.
+  bool AllowInvariantLoads = AllowInnerLoopInvariantLoads &&
+                             OuterLoop->getSubLoops().size() == 1 &&
+                             OuterLoop->getSubLoops().front() == InnerLoop &&
+                             InnerLoop->getSubLoops().empty();
+
   // We do not have any basic block in between now make sure the outer header
   // and outer loop latch doesn't contain any unsafe instructions.
-  if (containsUnsafeInstructions(OuterLoopHeader, Skip) ||
-      containsUnsafeInstructions(OuterLoopLatch, Skip))
+  if (containsUnsafeInstructions(OuterLoopHeader, Skip, AllowInvariantLoads) ||
+      containsUnsafeInstructions(OuterLoopLatch, Skip, AllowInvariantLoads))
     return false;
 
   // Also make sure the inner loop preheader does not contain any unsafe
   // instructions. Note that all instructions in the preheader will be moved to
   // the outer loop header when interchanging.
   if (InnerLoopPreHeader != OuterLoopHeader &&
-      containsUnsafeInstructions(InnerLoopPreHeader, Skip))
+      containsUnsafeInstructions(InnerLoopPreHeader, Skip, AllowInvariantLoads))
     return false;
 
   BasicBlock *InnerLoopExit = InnerLoop->getExitBlock();
@@ -1363,6 +1401,18 @@ bool LoopInterchangeLegality::isInnerReduction(
 }
 
 bool LoopInterchangeLegality::checkInductionsAndReductions(Loop *OuterLoop) {
+  // This routine, and the interchange it gates, only understands a nest that
+  // is a simple chain: each loop has at most one child loop. Bail out
+  // conservatively otherwise instead of asserting, since a candidate outer
+  // loop can legitimately contain sibling inner loops (e.g. once improved
+  // delinearization lets such a nest be considered at all).
+  for (Loop *L = OuterLoop; L; L = L->getSubLoops().front()) {
+    if (L->getSubLoops().size() > 1)
+      return false;
+    if (L->getSubLoops().empty())
+      break;
+  }
+
   auto ChildLoop = [](Loop *L) {
     assert(L->getSubLoops().size() <= 1 &&
            "Expect at most one child loop for now.");
@@ -1664,8 +1714,9 @@ bool LoopInterchangeLegality::canInterchangeLoops(unsigned InnerLoopId,
   // Check if outer and inner loop contain legal instructions only.
   for (auto *BB : OuterLoop->blocks())
     for (Instruction &I : *BB) {
-      // Loads and stores are checked separately, so we can skip them here.
-      if (isa<LoadInst, StoreInst, PseudoProbeInst>(&I))
+      // Loads and stores are checked separately. llvm.assume has no runtime
+      // behavior and is already accepted by containsUnsafeInstructions().
+      if (isa<LoadInst, StoreInst, PseudoProbeInst, AssumeInst>(&I))
         continue;
 
       // We cannot ignore potential memory reads, e.g., loads inside the called
@@ -1915,6 +1966,27 @@ int LoopInterchangeProfitability::getInstrOrderCost() {
         GoodBasePtrs.insert(BasePtr);
       else if (SE->isKnownPredicate(ICmpInst::ICMP_SLT, OuterStep, InnerStep))
         BadBasePtrs.insert(BasePtr);
+      else {
+        // The strides could not be strictly ordered. This happens for
+        // parametric Fortran extents, whose stride is ElementSize *
+        // (1 + smax(0, ub-lb)): SCEV cannot prove an ordering because the
+        // extent might be zero for an empty array. If one stride divides the
+        // other exactly with a non-constant quotient, the dividend is a
+        // parametric multiple of the divisor, so the loop carrying it walks
+        // the larger stride and should be inner. Divide the raw coefficients
+        // rather than their absolute values: a sign-unknown parametric factor
+        // (e.g. sext of a runtime extent) gets wrapped by getAbsExpr into a
+        // form SCEVDivision cannot cancel, which would hide the relationship.
+        const SCEV *Q, *R;
+        SCEVDivision::divide(*SE, *InnerCoeff, *OuterCoeff, &Q, &R);
+        if (R->isZero() && !isa<SCEVConstant>(Q)) {
+          BadBasePtrs.insert(BasePtr);
+        } else {
+          SCEVDivision::divide(*SE, *OuterCoeff, *InnerCoeff, &Q, &R);
+          if (R->isZero() && !isa<SCEVConstant>(Q))
+            GoodBasePtrs.insert(BasePtr);
+        }
+      }
     }
   }
 

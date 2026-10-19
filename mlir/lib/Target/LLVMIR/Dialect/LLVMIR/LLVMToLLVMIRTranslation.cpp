@@ -919,6 +919,31 @@ amendOperationImpl(Operation &op, ArrayRef<llvm::Instruction *> instructions,
                    NamedAttribute attribute,
                    LLVM::ModuleTranslation &moduleTranslation) {
   StringRef name = attribute.getName();
+
+  // Handle array.dims metadata for AllocaOp.
+  if (name == "llvm.array.dims" && isa<LLVM::AllocaOp>(op)) {
+    if (auto arrayDimsAttr = dyn_cast<ArrayAttr>(attribute.getValue())) {
+      // Create metadata node from array dimension sizes.
+      llvm::LLVMContext &ctx = moduleTranslation.getLLVMContext();
+      llvm::SmallVector<llvm::Metadata *, 4> dims;
+      for (Attribute attr : arrayDimsAttr) {
+        if (auto intAttr = dyn_cast<IntegerAttr>(attr)) {
+          dims.push_back(llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+              llvm::Type::getInt64Ty(ctx), intAttr.getInt())));
+        }
+      }
+      if (!dims.empty()) {
+        llvm::MDNode *arrayDimsMD = llvm::MDNode::get(ctx, dims);
+        // Attach to all created instructions (should be just the alloca).
+        for (llvm::Instruction *inst : instructions) {
+          if (auto *alloca = dyn_cast<llvm::AllocaInst>(inst))
+            alloca->setMetadata(llvm::LLVMContext::MD_array_dims, arrayDimsMD);
+        }
+      }
+    }
+    return success();
+  }
+
   if (name == LLVMDialect::getMmraAttrName()) {
     SmallVector<llvm::MMRAMetadata::TagT> tags;
     if (auto oneTag = dyn_cast<LLVM::MMRATagAttr>(attribute.getValue())) {
@@ -945,6 +970,17 @@ amendOperationImpl(Operation &op, ArrayRef<llvm::Instruction *> instructions,
       inst->setMetadata(llvm::LLVMContext::MD_mmra, mmraMd);
     return success();
   }
+
+  // Handle llvm.array_bounds attribute - marks assumes as array bounds checks
+  // that should be dropped before vectorization.
+  if (name == "llvm.array_bounds") {
+    llvm::LLVMContext &ctx = moduleTranslation.getLLVMContext();
+    llvm::MDNode *md = llvm::MDNode::get(ctx, {});
+    for (llvm::Instruction *inst : instructions)
+      inst->setMetadata("llvm.array.bounds", md);
+    return success();
+  }
+
   return success();
 }
 

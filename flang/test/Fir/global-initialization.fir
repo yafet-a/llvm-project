@@ -8,7 +8,7 @@ fir.global internal @_QEmask : !fir.array<32xi32> {
   fir.has_value %2 : !fir.array<32xi32>
 }
 
-// CHECK: llvm.mlir.global internal @_QEmask() {addr_space = 0 : i32} : !llvm.array<32 x i32> {
+// CHECK: llvm.mlir.global internal @_QEmask() {addr_space = 0 : i32, llvm.array.dims = [32]} : !llvm.array<32 x i32> {
 // CHECK:   [[VAL0:%.*]] = llvm.mlir.constant(1 : i32) : i32
 // CHECK:   [[VAL1:%.*]] = llvm.mlir.undef : !llvm.array<32 x i32>
 // CHECK:   [[VAL2:%.*]] = llvm.mlir.constant(dense<1> : vector<32xi32>) : !llvm.array<32 x i32>
@@ -22,7 +22,7 @@ fir.global internal @_QEmultiarray : !fir.array<32x32xi32> {
   fir.has_value %2 : !fir.array<32x32xi32>
 }
 
-// CHECK: llvm.mlir.global internal @_QEmultiarray() {addr_space = 0 : i32} : !llvm.array<32 x array<32 x i32>> {
+// CHECK: llvm.mlir.global internal @_QEmultiarray() {addr_space = 0 : i32, llvm.array.dims = [32, 32]} : !llvm.array<32 x array<32 x i32>> {
 // CHECK:   [[VAL0:%.*]] = llvm.mlir.constant(1 : i32) : i32
 // CHECK:   [[VAL1:%.*]] = llvm.mlir.undef : !llvm.array<32 x array<32 x i32>>
 // CHECK:   [[VAL2:%.*]] = llvm.mlir.constant(dense<1> : vector<32x32xi32>) : !llvm.array<32 x array<32 x i32>>
@@ -37,7 +37,7 @@ fir.global internal @_QEmasklogical : !fir.array<32768x!fir.logical<4>> {
   fir.has_value %2 : !fir.array<32768x!fir.logical<4>>
 }
 
-// CHECK: llvm.mlir.global internal @_QEmasklogical() {addr_space = 0 : i32} : !llvm.array<32768 x i32> {
+// CHECK: llvm.mlir.global internal @_QEmasklogical() {addr_space = 0 : i32, llvm.array.dims = [32768]} : !llvm.array<32768 x i32> {
 // CHECK:   [[VAL0:%.*]] = llvm.mlir.constant(true) : i1
 // CHECK:   [[VAL1:%.*]] = llvm.mlir.undef : !llvm.array<32768 x i32>
 // CHECK:   [[VAL2:%.*]] = llvm.mlir.constant(1 : i32) : i32

@@ -11463,9 +11463,20 @@ std::optional<bool> ScalarEvolution::evaluatePredicate(CmpPredicate Pred,
 bool ScalarEvolution::isKnownPredicateAt(CmpPredicate Pred, const SCEV *LHS,
                                          const SCEV *RHS,
                                          const Instruction *CtxI) {
-  // TODO: Analyze guards and assumes from Context's block.
-  return isKnownPredicate(Pred, LHS, RHS) ||
-         isBasicBlockEntryGuardedByCond(CtxI->getParent(), Pred, LHS, RHS);
+  if (isKnownPredicate(Pred, LHS, RHS) ||
+      isBasicBlockEntryGuardedByCond(CtxI->getParent(), Pred, LHS, RHS))
+    return true;
+
+  // isBasicBlockEntryGuardedByCond() only considers facts that hold on entry
+  // to the context block. Also consider assumptions earlier in the block.
+  for (auto &AssumeVH : AC.assumptions()) {
+    auto *Assume = dyn_cast_or_null<AssumeInst>(AssumeVH);
+    if (!Assume || !isValidAssumeForContext(Assume, CtxI, &DT))
+      continue;
+    if (isImpliedCond(Pred, LHS, RHS, Assume->getArgOperand(0), false, CtxI))
+      return true;
+  }
+  return false;
 }
 
 std::optional<bool>
@@ -11475,10 +11486,10 @@ ScalarEvolution::evaluatePredicateAt(CmpPredicate Pred, const SCEV *LHS,
   if (KnownWithoutContext)
     return KnownWithoutContext;
 
-  if (isBasicBlockEntryGuardedByCond(CtxI->getParent(), Pred, LHS, RHS))
+  if (isKnownPredicateAt(Pred, LHS, RHS, CtxI))
     return true;
-  if (isBasicBlockEntryGuardedByCond(
-          CtxI->getParent(), ICmpInst::getInverseCmpPredicate(Pred), LHS, RHS))
+  if (isKnownPredicateAt(ICmpInst::getInverseCmpPredicate(Pred), LHS, RHS,
+                         CtxI))
     return false;
   return std::nullopt;
 }

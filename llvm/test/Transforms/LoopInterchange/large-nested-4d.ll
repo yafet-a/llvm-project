@@ -51,15 +51,15 @@ target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i6
 ; CHECK-NEXT:     - String:          All loops have dependencies in all directions.
 ; CHECK-NEXT:   ...
 
-@GlobC = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
-@GlobD = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
-@GlobE = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
-@GlobF = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
-@GlobG = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
-@GlobH = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
-@GlobI = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
-@GlobJ = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
-@GlobL = local_unnamed_addr global [1000 x [1000 x double]] zeroinitializer
+@GlobC = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer, !array.dims !1
+@GlobD = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer, !array.dims !1
+@GlobE = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer, !array.dims !1
+@GlobF = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer, !array.dims !1
+@GlobG = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer, !array.dims !1
+@GlobH = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer, !array.dims !1
+@GlobI = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer, !array.dims !1
+@GlobJ = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer, !array.dims !1
+@GlobL = local_unnamed_addr global [1000 x [1000 x double]] zeroinitializer, !array.dims !2
 
 define void @test(ptr noalias readonly captures(none) %0, ptr noalias readonly captures(none) %1, ptr noalias captures(none) %2, ptr noalias captures(none) %3, ptr noalias readonly captures(none) %4, ptr noalias readonly captures(none) %5, ptr noalias readonly captures(none) %6, ptr noalias readonly captures(none) %7, ptr noalias readonly captures(none) %8, ptr noalias readonly captures(none) %9) {
 entry:
@@ -152,4 +152,5 @@ exit:
   ret void
 }
 
-
+!1 = !{i64 54, i64 54, i64 54}
+!2 = !{i64 1000, i64 1000}

@@ -67,6 +67,7 @@ add_llvm_component_library(LLVMScalarOpts
   PlaceSafepoints.cpp
   Reassociate.cpp
   Reg2Mem.cpp
+  RemoveRedundantArrayBoundAssumes.cpp
   RewriteStatepointsForGC.cpp
   SCCP.cpp
   SROA.cpp

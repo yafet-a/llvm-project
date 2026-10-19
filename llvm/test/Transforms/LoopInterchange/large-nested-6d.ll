@@ -56,82 +56,23 @@ target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i6
 ;
 ;
 ; CHECK:       --- !Analysis
-; CHECK-NEXT:  Pass:            loop-interchange
-; CHECK-NEXT:  Name:            Dependence
-; CHECK-NEXT:  Function:        test
-; CHECK-NEXT:  Args:
-; CHECK-NEXT:    - String:          Computed dependence info, invoking the transform.
-; CHECK-NEXT:  ...
-; CHECK-NEXT:  --- !Missed
-; CHECK-NEXT:  Pass:            loop-interchange
-; CHECK-NEXT:  Name:            Dependence
-; CHECK-NEXT:  Function:        test
-; CHECK-NEXT:  Args:
-; CHECK-NEXT:    - String:          Cannot interchange loops due to dependences.
-; CHECK-NEXT:  ...
-; CHECK-NEXT:  --- !Missed
-; CHECK-NEXT:  Pass:            loop-interchange
-; CHECK-NEXT:  Name:            Dependence
-; CHECK-NEXT:  Function:        test
-; CHECK-NEXT:  Args:
-; CHECK-NEXT:    - String:          Cannot interchange loops due to dependences.
-; CHECK-NEXT:  ...
-; CHECK-NEXT:  --- !Missed
-; CHECK-NEXT:  Pass:            loop-interchange
-; CHECK-NEXT:  Name:            Dependence
-; CHECK-NEXT:  Function:        test
-; CHECK-NEXT:  Args:
-; CHECK-NEXT:    - String:          All loops have dependencies in all directions.
-; CHECK-NEXT:  ...
-; CHECK-NEXT:  --- !Analysis
-; CHECK-NEXT:  Pass:            loop-interchange
-; CHECK-NEXT:  Name:            Dependence
-; CHECK-NEXT:  Function:        test
-; CHECK-NEXT:  Args:
-; CHECK-NEXT:    - String:          Computed dependence info, invoking the transform.
-; CHECK-NEXT:  ...
-; CHECK-NEXT:  --- !Missed
-; CHECK-NEXT:  Pass:            loop-interchange
-; CHECK-NEXT:  Name:            Dependence
-; CHECK-NEXT:  Function:        test
-; CHECK-NEXT:  Args:
-; CHECK-NEXT:    - String:          Cannot interchange loops due to dependences.
-; CHECK-NEXT:  ...
-; CHECK-NEXT:  --- !Analysis
-; CHECK-NEXT:  Pass:            loop-interchange
-; CHECK-NEXT:  Name:            Dependence
-; CHECK-NEXT:  Function:        test
-; CHECK-NEXT:  Args:
-; CHECK-NEXT:    - String:          Computed dependence info, invoking the transform.
-; CHECK-NEXT:  ...
-; CHECK-NEXT:  --- !Analysis
-; CHECK-NEXT:  Pass:            loop-interchange
-; CHECK-NEXT:  Name:            Dependence
-; CHECK-NEXT:  Function:        test
-; CHECK-NEXT:  Args:
-; CHECK-NEXT:    - String:          Computed dependence info, invoking the transform.
-; CHECK-NEXT:  ...
-; CHECK-NEXT:  --- !Missed
-; CHECK-NEXT:  Pass:            loop-interchange
-; CHECK-NEXT:  Name:            Dependence
-; CHECK-NEXT:  Function:        test
-; CHECK-NEXT:  Args:
-; CHECK-NEXT:    - String:          All loops have dependencies in all directions.
-; CHECK-NEXT:  ...
-; CHECK-NEXT:  --- !Analysis
-; CHECK-NEXT:  Pass:            loop-interchange
-; CHECK-NEXT:  Name:            Dependence
-; CHECK-NEXT:  Function:        test
-; CHECK-NEXT:  Args:
-; CHECK-NEXT:    - String:          Computed dependence info, invoking the transform.
-; CHECK-NEXT:  ...
-; CHECK-NEXT:  --- !Missed
-; CHECK-NEXT:  Pass:            loop-interchange
-; CHECK-NEXT:  Name:            Dependence
-; CHECK-NEXT:  Function:        test
-; CHECK-NEXT:  Args:
-; CHECK-NEXT:    - String:          All loops have dependencies in all directions.
-; CHECK-NEXT:  ...
+; CHECK:       Name:            Dependence
+; CHECK:         - String:          Computed dependence info, invoking the transform.
+; CHECK:       --- !Missed
+; CHECK:       Name:            Dependence
+; CHECK:         - String:          Cannot interchange loops due to dependences.
+; CHECK:       --- !Missed
+; CHECK:       Name:            NotTightlyNested
+; CHECK:         - String:          Cannot interchange loops because they are not tightly nested.
+; CHECK:       --- !Missed
+; CHECK:       Name:            InterchangeNotProfitable
+; CHECK:         - String:          Insufficient information to calculate the cost of loop for interchange.
+; CHECK:       --- !Missed
+; CHECK:       Name:            InterchangeNotProfitable
+; CHECK:         - String:          Insufficient information to calculate the cost of loop for interchange.
+; CHECK:       --- !Missed
+; CHECK:       Name:            Dependence
+; CHECK:         - String:          All loops have dependencies in all directions.
 
 @GlobC = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
 @GlobD = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
@@ -142,7 +83,7 @@ target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i8:8:32-i16:16:32-i6
 @GlobI = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
 @GlobJ = local_unnamed_addr global [54 x [54 x [54 x double]]] zeroinitializer
 @GlobK = local_unnamed_addr global [1000 x [1000 x double]] zeroinitializer
-@GlobL = local_unnamed_addr global [1000 x [1000 x double]] zeroinitializer
+@GlobL = local_unnamed_addr global [1000 x [1000 x double]] zeroinitializer, !array.dims !0
 @GlobM = local_unnamed_addr global [2500 x double] zeroinitializer
 
 define void @test(ptr noalias readonly captures(none) %0, ptr noalias readonly captures(none) %1, ptr noalias captures(none) %2, ptr noalias captures(none) %3, ptr noalias readonly captures(none) %4, ptr noalias readonly captures(none) %5, ptr noalias readonly captures(none) %6, ptr noalias readonly captures(none) %7, ptr noalias readonly captures(none) %8, ptr noalias readonly captures(none) %9) {
@@ -296,6 +237,8 @@ M.header:
 
 i.header:
   %i = phi i64 [ %i.next, %i.latch ], [ 1, %M.header ]
+  %assume.i.in.bounds = icmp samesign ult i64 %i, 55
+  call void @llvm.assume(i1 %assume.i.in.bounds)
   %92 = add nsw i64 %34, %i
   %93 = add nsw i64 %i, -1
   %94 = mul nsw i64 %93, %21
@@ -304,12 +247,21 @@ i.header:
 
 j.header:
   %j = phi i64 [ %j.next, %j.latch ], [ 1, %i.header ]
+  %assume.j.in.bounds = icmp samesign ult i64 %j, 55
+  call void @llvm.assume(i1 %assume.j.in.bounds)
+  %globL.first.index = add nsw i64 %94, %j
+  %assume.globL.first.index.nonzero = icmp ne i64 %globL.first.index, 0
+  %assume.globL.first.index.in.bounds = icmp samesign ult i64 %globL.first.index, 1001
+  call void @llvm.assume(i1 %assume.globL.first.index.nonzero)
+  call void @llvm.assume(i1 %assume.globL.first.index.in.bounds)
   %95 = add nsw i64 %91, %j
   %gep358 = getelementptr double, ptr %invariant.gep, i64 %j
   br label %IL.header
 
 IL.header:
   %IL = phi i64 [ %IL.next, %IL.latch ], [ 1, %j.header ]
+  %assume.IL.in.bounds = icmp samesign ult i64 %IL, 55
+  call void @llvm.assume(i1 %assume.IL.in.bounds)
   %96 = mul nuw nsw i64 %IL, 54
   %97 = add nsw i64 %92, %96
   %98 = getelementptr double, ptr @GlobC, i64 %97
@@ -326,6 +278,8 @@ IL.header:
 
 JL.body:
   %JL = phi i64 [ %JL.next, %JL.body ], [ 1, %IL.header ]
+  %assume.JL.in.bounds = icmp samesign ult i64 %JL, 55
+  call void @llvm.assume(i1 %assume.JL.in.bounds)
   %109 = mul nuw nsw i64 %JL, 54
   %110 = add nsw i64 %95, %109
   %111 = getelementptr double, ptr @GlobD, i64 %110
@@ -344,6 +298,10 @@ JL.body:
   %124 = fmul fast double %123, %105
   %125 = fadd fast double %121, %124
   %126 = add nsw i64 %JL, %107
+  %assume.globL.second.index.nonzero = icmp ne i64 %126, 0
+  %assume.globL.second.index.in.bounds = icmp samesign ult i64 %126, 1001
+  call void @llvm.assume(i1 %assume.globL.second.index.nonzero)
+  call void @llvm.assume(i1 %assume.globL.second.index.in.bounds)
   %.idx247.us.us.us.us.us.us = mul nsw i64 %126, 8000
   %gep.us.us.us.us.us.us = getelementptr i8, ptr %gep358, i64 %.idx247.us.us.us.us.us.us
   %127 = getelementptr i8, ptr %gep.us.us.us.us.us.us, i64 -8008
@@ -573,3 +531,6 @@ declare i32 @llvm.smax.i32(i32, i32)
 declare void @llvm.memset.p0.i64(ptr writeonly captures(none), i8, i64, i1 immarg)
 declare void @free(ptr allocptr noundef captures(none)) local_unnamed_addr
 declare noalias noundef ptr @malloc(i64 noundef) local_unnamed_addr
+declare void @llvm.assume(i1 noundef)
+
+!0 = !{i64 1000, i64 1000}

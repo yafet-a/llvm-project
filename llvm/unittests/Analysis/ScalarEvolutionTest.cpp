@@ -1478,6 +1478,96 @@ TEST_F(ScalarEvolutionsTest, ImpliedViaAddRecStart) {
   });
 }
 
+TEST_F(ScalarEvolutionsTest, PredicateAtUsesEarlierSameBlockAssume) {
+  LLVMContext C;
+  SMDiagnostic Err;
+  std::unique_ptr<Module> M = parseAssemblyString(
+      "declare void @llvm.assume(i1) "
+      "define void @foo(i64 %x) { "
+      "entry: "
+      "  %cmp = icmp ult i64 %x, 100 "
+      "  call void @llvm.assume(i1 %cmp) "
+      "  %context.after = add i64 %x, 0 "
+      "  ret void "
+      "} ",
+      Err, C);
+
+  ASSERT_TRUE(M && "Could not parse module?");
+  ASSERT_TRUE(!verifyModule(*M) && "Must have been well formed!");
+
+  runWithSE(*M, "foo", [](Function &F, LoopInfo &LI, ScalarEvolution &SE) {
+    const SCEV *X = SE.getSCEV(F.getArg(0));
+    const SCEV *Hundred = SE.getConstant(X->getType(), 100);
+    auto *After = getInstructionByName(F, "context.after");
+    EXPECT_TRUE(SE.isKnownPredicateAt(ICmpInst::ICMP_ULT, X, Hundred, After));
+    EXPECT_EQ(
+        SE.evaluatePredicateAt(ICmpInst::ICMP_ULT, X, Hundred, After), true);
+    EXPECT_EQ(
+        SE.evaluatePredicateAt(ICmpInst::ICMP_UGE, X, Hundred, After), false);
+  });
+}
+
+TEST_F(ScalarEvolutionsTest, PredicateAtUsesLaterSameBlockAssume) {
+  LLVMContext C;
+  SMDiagnostic Err;
+  std::unique_ptr<Module> M = parseAssemblyString(
+      "declare void @llvm.assume(i1) "
+      "define void @foo(i64 %x) { "
+      "entry: "
+      "  %context.before = add i64 %x, 0 "
+      "  %cmp = icmp ult i64 %x, 100 "
+      "  call void @llvm.assume(i1 %cmp) "
+      "  ret void "
+      "} ",
+      Err, C);
+
+  ASSERT_TRUE(M && "Could not parse module?");
+  ASSERT_TRUE(!verifyModule(*M) && "Must have been well formed!");
+
+  runWithSE(*M, "foo", [](Function &F, LoopInfo &LI, ScalarEvolution &SE) {
+    const SCEV *X = SE.getSCEV(F.getArg(0));
+    const SCEV *Hundred = SE.getConstant(X->getType(), 100);
+    auto *Before = getInstructionByName(F, "context.before");
+    EXPECT_TRUE(SE.isKnownPredicateAt(ICmpInst::ICMP_ULT, X, Hundred, Before));
+    EXPECT_EQ(
+        SE.evaluatePredicateAt(ICmpInst::ICMP_ULT, X, Hundred, Before), true);
+  });
+}
+
+TEST_F(ScalarEvolutionsTest, PredicateAtRejectsNonDominatingAssume) {
+  LLVMContext C;
+  SMDiagnostic Err;
+  std::unique_ptr<Module> M = parseAssemblyString(
+      "declare void @llvm.assume(i1) "
+      "define void @foo(i64 %x, i1 %take.assume) { "
+      "entry: "
+      "  br i1 %take.assume, label %with.assume, label %without.assume "
+      "with.assume: "
+      "  %cmp = icmp ult i64 %x, 100 "
+      "  call void @llvm.assume(i1 %cmp) "
+      "  br label %merge "
+      "without.assume: "
+      "  br label %merge "
+      "merge: "
+      "  %context = add i64 %x, 0 "
+      "  ret void "
+      "} ",
+      Err, C);
+
+  ASSERT_TRUE(M && "Could not parse module?");
+  ASSERT_TRUE(!verifyModule(*M) && "Must have been well formed!");
+
+  runWithSE(*M, "foo", [](Function &F, LoopInfo &LI, ScalarEvolution &SE) {
+    const SCEV *X = SE.getSCEV(F.getArg(0));
+    const SCEV *Hundred = SE.getConstant(X->getType(), 100);
+    auto *Context = getInstructionByName(F, "context");
+    EXPECT_FALSE(
+        SE.isKnownPredicateAt(ICmpInst::ICMP_ULT, X, Hundred, Context));
+    EXPECT_FALSE(
+        SE.evaluatePredicateAt(ICmpInst::ICMP_ULT, X, Hundred, Context));
+  });
+}
+
 TEST_F(ScalarEvolutionsTest, UnsignedIsImpliedViaOperations) {
   LLVMContext C;
   SMDiagnostic Err;

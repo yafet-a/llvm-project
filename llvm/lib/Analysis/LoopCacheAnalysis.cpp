@@ -379,7 +379,9 @@ bool IndexedReference::delinearize(const LoopInfo &LI) {
     AccessFn = SE.getMinusSCEV(AccessFn, BasePointer);
 
     // Try to delinearize fixed-size arrays.
-    if (delinearizeFixedSizeArray(SE, AccessFn, Subscripts, Sizes, ElemSize)) {
+    DelinearizationShapeKind ShapeKind;
+    if (delinearizeFixedSizeArray(SE, AccessFn, Subscripts, Sizes, ElemSize,
+                                  ShapeKind)) {
       IsFixedSize = true;
       LLVM_DEBUG(dbgs().indent(2) << "In Loop '" << L->getName()
                                   << "', AccessFn: " << *AccessFn << "\n");

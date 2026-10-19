@@ -66,6 +66,30 @@ using namespace mlir::LLVM::detail;
 
 #include "mlir/Dialect/LLVMIR/LLVMConversionEnumsToLLVM.inc"
 
+// Attribute name for array dimensions from Flang.
+static constexpr llvm::StringLiteral kArrayDimsAttrName = "llvm.array.dims";
+
+/// Create array.dims metadata from MLIR attribute.
+/// The attribute contains array dimension sizes.
+static llvm::MDNode *createArrayDimsMetadata(llvm::LLVMContext &ctx,
+                                             ArrayAttr arrayDims) {
+  if (!arrayDims || arrayDims.empty())
+    return nullptr;
+
+  llvm::SmallVector<llvm::Metadata *, 4> dims;
+  for (Attribute attr : arrayDims) {
+    if (auto intAttr = mlir::dyn_cast<IntegerAttr>(attr)) {
+      dims.push_back(llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+          llvm::Type::getInt64Ty(ctx), intAttr.getInt())));
+    }
+  }
+
+  if (dims.empty())
+    return nullptr;
+
+  return llvm::MDNode::get(ctx, dims);
+}
+
 namespace {
 /// A customized inserter for LLVM's IRBuilder that captures all LLVM IR
 /// instructions that are created for future reference.
@@ -1266,6 +1290,13 @@ LogicalResult ModuleTranslation::convertGlobalsAndAliases() {
       var->setAlignment(llvm::MaybeAlign(alignment.value()));
 
     var->setVisibility(convertVisibilityToLLVM(op.getVisibility_()));
+
+    // Attach array.dims metadata if present.
+    if (auto arrayDimsAttr = op->getAttrOfType<ArrayAttr>(kArrayDimsAttrName)) {
+      if (llvm::MDNode *arrayDimsMD =
+              createArrayDimsMetadata(llvmModule->getContext(), arrayDimsAttr))
+        var->setMetadata(llvm::LLVMContext::MD_array_dims, arrayDimsMD);
+    }
 
     globalsMapping.try_emplace(op, var);
     globalsByNameMapping.try_emplace(op.getSymName(), var);

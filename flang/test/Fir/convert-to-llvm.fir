@@ -108,8 +108,8 @@ fir.global internal @_QEmultiarray : !fir.array<32x32xi32> {
 }
 
 // CHECK: llvm.mlir.global internal @_QEmultiarray() 
-// GENERIC-SAME: {addr_space = 0 : i32}
-// AMDGPU-SAME: {addr_space = 1 : i32}
+// GENERIC-SAME: {addr_space = 0 : i32, llvm.array.dims = [32, 32]}
+// AMDGPU-SAME: {addr_space = 1 : i32, llvm.array.dims = [32, 32]}
 // CHECK-SAME: : !llvm.array<32 x array<32 x i32>> {
 // CHECK:   %[[CST:.*]] = llvm.mlir.constant(dense<1> : vector<32x32xi32>) : !llvm.array<32 x array<32 x i32>>
 // CHECK:   llvm.return %[[CST]] : !llvm.array<32 x array<32 x i32>>
@@ -128,8 +128,8 @@ fir.global internal @_QEmultiarray : !fir.array<32xi32> {
 }
 
 // CHECK:          llvm.mlir.global internal @_QEmultiarray() 
-// GENERIC-SAME: {addr_space = 0 : i32}
-// AMDGPU-SAME: {addr_space = 1 : i32}
+// GENERIC-SAME: {addr_space = 0 : i32, llvm.array.dims = [32]}
+// AMDGPU-SAME: {addr_space = 1 : i32, llvm.array.dims = [32]}
 // CHECK-SAME: : !llvm.array<32 x i32> {
 // CHECK:            %[[CST:.*]] = llvm.mlir.constant(1 : i32) : i32
 // CHECK:            %{{.*}} = llvm.mlir.undef : !llvm.array<32 x i32>
@@ -2640,8 +2640,8 @@ func.func @coordinate_array_unknown_size_1d(%arg0: !fir.ptr<!fir.array<? x i32>>
 fir.global common @c_(dense<0> : vector<4294967296xi8>) : !fir.array<4294967296xi8>
 
 // CHECK: llvm.mlir.global common @c_(dense<0> : vector<4294967296xi8>) 
-// GENERIC-SAME: {addr_space = 0 : i32}
-// AMDGPU-SAME: {addr_space = 1 : i32}
+// GENERIC-SAME: {addr_space = 0 : i32, llvm.array.dims = [4294967296]}
+// AMDGPU-SAME: {addr_space = 1 : i32, llvm.array.dims = [4294967296]}
 // CHECK-SAME: !llvm.array<4294967296 x i8>
 
 // -----

@@ -7965,6 +7965,43 @@ The `!captures` attribute makes no statement about other uses of `%x`, or
 uses of the stored-to memory location after it has been overwritten with a
 different value.
 
+#### '`array.dims`' Metadata
+
+The `!array.dims` metadata can be attached to `alloca` instructions and
+global variable declarations to provide array dimension information. This
+metadata enables delinearization (recovering multi-dimensional array subscripts
+from linearized memory accesses) without relying on type information.
+
+The metadata is a list of integer constants representing the size of each
+dimension:
+
+```llvm
+    %arr = alloca [10 x [20 x i32]], !array.dims !{i64 10, i64 20}
+    @global = global [5 x [10 x float]], !array.dims !{i64 5, i64 10}
+```
+
+The metadata indicates the declared dimensions of the array. Language front-ends
+should emit this metadata for fixed-size array declarations. Metadata is in
+memory layout order. Fortran uses column-major layout, so dimensions appear
+reversed from source order:
+
+```fortran
+    REAL :: A(5, 10)  ! Source declaration
+```
+
+```llvm
+    ; Memory: [10 x [5 x float]] (column-major)
+    %A = alloca [10 x [5 x float]], !array.dims !{i64 10, i64 5}
+```
+
+Front-ends should be conservative when emitting this metadata as the info will
+be used for optimization. In particular, front-ends should avoid emit array.dims
+when array bounds sanitizers are enabled (`-fsanitize=bounds`).
+
+The array.dims metadata is used by delinearization analysis to recover array
+subscripts for the memory dependence analysis in loops. The array.dims metadata
+is also used by SCEV analysis to bound the back-edge taken count.
+
 #### '`mem.cache_hint`' Metadata
 
 The `!mem.cache_hint` metadata may be attached to any instruction that reads

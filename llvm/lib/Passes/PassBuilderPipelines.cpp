@@ -88,6 +88,7 @@
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/AlignmentFromAssumptions.h"
 #include "llvm/Transforms/Scalar/AnnotationRemarks.h"
+#include "llvm/Transforms/Scalar/RemoveRedundantArrayBoundAssumes.h"
 #include "llvm/Transforms/Scalar/BDCE.h"
 #include "llvm/Transforms/Scalar/CallSiteSplitting.h"
 #include "llvm/Transforms/Scalar/ConstraintElimination.h"
@@ -1634,6 +1635,11 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
 
   OptimizePM.addPass(
       createFunctionToLoopPassAdaptor(std::move(LPM), /*UseMemorySSA=*/false));
+
+  // Array-bound assumptions have now reached LoopInterchange, their final
+  // consumer in this experiment. Remove them before loop distribution and
+  // vectorization.
+  OptimizePM.addPass(RemoveRedundantArrayBoundAssumesPass());
 
   // FIXME: This may not be the right place in the pipeline.
   // We need to have the data to support the right place.

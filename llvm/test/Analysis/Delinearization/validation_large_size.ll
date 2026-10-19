@@ -11,6 +11,8 @@
 ; offset calculation can overflow. The delinearization validation should
 ; consider such cases as invalid.
 
+@complete_shape_too_large = external global [4294967296 x [4294967296 x i8]], !array.dims !0
+
 ; for (i = 0; i < (1ULL << 60); i++)
 ;   for (j = 0; j < 256; j++)
 ;     A[i*256 + j] = 0;
@@ -178,3 +180,43 @@ for.i.latch:
 exit:
   ret void
 }
+
+; A complete metadata shape avoids multiplying a recovered unknown outer
+; subscript, but the complete object size must itself fit in the index type.
+; 2^32 * 2^32 does not fit in i64, so this shape is rejected.
+define void @complete_shape_cause_ovfl() {
+; CHECK-LABEL: 'complete_shape_cause_ovfl'
+; CHECK-NEXT:  Inst: store i8 0, ptr %gep, align 1
+; CHECK-NEXT:  AccessFunction: {{\{\{}}0,+,4294967296}<nuw><nsw><%outer>,+,1}<nuw><nsw><%inner>
+; CHECK-NEXT:  Base offset: @complete_shape_too_large
+; CHECK-NEXT:  ArrayDecl[4294967296][4294967296] with elements of 1 bytes.
+; CHECK-NEXT:  ArrayRef[{0,+,1}<nuw><nsw><%outer>][{0,+,1}<nuw><nsw><%inner>]
+; CHECK-NEXT:  Delinearization validation: Failed
+;
+entry:
+  br label %outer
+
+outer:
+  %i = phi i64 [ 0, %entry ], [ %i.next, %outer.latch ]
+  br label %inner
+
+inner:
+  %j = phi i64 [ 0, %outer ], [ %j.next, %inner ]
+  %offset.outer = mul nuw nsw i64 %i, 4294967296
+  %offset = add nuw nsw i64 %offset.outer, %j
+  %gep = getelementptr i8, ptr @complete_shape_too_large, i64 %offset
+  store i8 0, ptr %gep
+  %j.next = add nuw nsw i64 %j, 1
+  %j.exit = icmp eq i64 %j.next, 5
+  br i1 %j.exit, label %outer.latch, label %inner
+
+outer.latch:
+  %i.next = add nuw nsw i64 %i, 1
+  %i.exit = icmp eq i64 %i.next, 5
+  br i1 %i.exit, label %return, label %outer
+
+return:
+  ret void
+}
+
+!0 = !{i64 4294967296, i64 4294967296}

@@ -1766,6 +1766,40 @@ bool DependenceInfo::testMIV(const SCEV *Src, const SCEV *Dst,
          banerjeeMIVtest(Src, Dst, Loops, Result);
 }
 
+/// Return true when Expr is a two-level mixed-radix recurrence
+/// `Outer * TripCount(Inner) + Inner`. With no-wrap recurrences and a unit-step
+/// inner loop, this maps each pair of normalized loop iterations to a distinct
+/// integer.
+static bool isKnownInjectiveTwoLevelAddRec(const SCEV *Expr,
+                                           ScalarEvolution &SE,
+                                           const Instruction *CtxI) {
+  const auto *InnerAR = dyn_cast<SCEVAddRecExpr>(Expr);
+  if (!InnerAR || !InnerAR->isAffine() || !InnerAR->hasNoSignedWrap())
+    return false;
+
+  const auto *OuterAR = dyn_cast<SCEVAddRecExpr>(InnerAR->getStart());
+  if (!OuterAR || !OuterAR->isAffine() || !OuterAR->hasNoSignedWrap() ||
+      SE.containsAddRecurrence(OuterAR->getStart()))
+    return false;
+
+  const Loop *InnerLoop = InnerAR->getLoop();
+  const Loop *OuterLoop = OuterAR->getLoop();
+  if (!OuterLoop->contains(InnerLoop) ||
+      !InnerAR->getStepRecurrence(SE)->isOne())
+    return false;
+
+  const SCEV *InnerBTC = SE.getBackedgeTakenCount(InnerLoop);
+  if (isa<SCEVCouldNotCompute>(InnerBTC))
+    return false;
+
+  const SCEV *Radix =
+      SE.getAddExpr(InnerBTC, SE.getOne(InnerBTC->getType()));
+  const SCEV *OuterStep = OuterAR->getStepRecurrence(SE);
+  return !SE.containsAddRecurrence(OuterStep) && Radix == OuterStep &&
+         SE.isKnownPredicateAt(ICmpInst::ICMP_SGT, OuterStep,
+                               SE.getZero(OuterStep->getType()), CtxI);
+}
+
 /// Given a SCEVMulExpr, returns its first operand if its first operand is a
 /// constant and the product doesn't overflow in a signed sense. Otherwise,
 /// returns std::nullopt. For example, given (10 * X * Y)<nsw>, it returns 10.
@@ -2523,15 +2557,19 @@ bool DependenceInfo::tryDelinearizeFixedSize(
   const SCEV *ElemSize = SE->getElementSize(Src);
   assert(ElemSize == SE->getElementSize(Dst) && "Different element sizes");
   SmallVector<const SCEV *, 4> SrcSizes, DstSizes;
-  if (!delinearizeFixedSizeArray(*SE, SE->removePointerBase(SrcAccessFn),
-                                 SrcSubscripts, SrcSizes, ElemSize) ||
-      !delinearizeFixedSizeArray(*SE, SE->removePointerBase(DstAccessFn),
-                                 DstSubscripts, DstSizes, ElemSize))
+  DelinearizationShapeKind SrcShapeKind, DstShapeKind;
+  if (!delinearizeFixedSizeArray(*SE, SrcAccessFn,
+                                  SrcSubscripts, SrcSizes, ElemSize,
+                                  SrcShapeKind) ||
+      !delinearizeFixedSizeArray(*SE, DstAccessFn,
+                                  DstSubscripts, DstSizes, ElemSize,
+                                  DstShapeKind))
     return false;
 
   // Check that the two size arrays are non-empty and equal in length and
   // value.  SCEV expressions are uniqued, so we can compare pointers.
-  if (SrcSizes.size() != DstSizes.size() ||
+  if (SrcShapeKind != DstShapeKind ||
+      SrcSizes.size() != DstSizes.size() ||
       !std::equal(SrcSizes.begin(), SrcSizes.end(), DstSizes.begin())) {
     SrcSubscripts.clear();
     DstSubscripts.clear();
@@ -2549,8 +2587,10 @@ bool DependenceInfo::tryDelinearizeFixedSize(
   // iff the subscripts are positive and are less than the range of the
   // dimension.
   if (!DisableDelinearizationChecks) {
-    if (!validateDelinearizationResult(*SE, SrcSizes, SrcSubscripts) ||
-        !validateDelinearizationResult(*SE, DstSizes, DstSubscripts)) {
+    if (!validateDelinearizationResult(*SE, SrcSizes, SrcSubscripts,
+                                       SrcShapeKind, Src) ||
+        !validateDelinearizationResult(*SE, DstSizes, DstSubscripts,
+                                       DstShapeKind, Dst)) {
       SrcSubscripts.clear();
       DstSubscripts.clear();
       return false;
@@ -2613,8 +2653,12 @@ bool DependenceInfo::tryDelinearizeParametricSize(
   // FIXME: It may be better to record these sizes and add them as constraints
   // to the dependency checks.
   if (!DisableDelinearizationChecks)
-    if (!validateDelinearizationResult(*SE, Sizes, SrcSubscripts) ||
-        !validateDelinearizationResult(*SE, Sizes, DstSubscripts))
+    if (!validateDelinearizationResult(
+            *SE, Sizes, SrcSubscripts,
+            DelinearizationShapeKind::UnknownOuterDimension, Src) ||
+        !validateDelinearizationResult(
+            *SE, Sizes, DstSubscripts,
+            DelinearizationShapeKind::UnknownOuterDimension, Dst))
       return false;
 
   return true;
@@ -2755,10 +2799,12 @@ DependenceInfo::depends(Instruction *Src, Instruction *Dst,
   SmallVector<Subscript, 2> Pair(Pairs);
   Pair[0].Src = SrcEv;
   Pair[0].Dst = DstEv;
+  bool HasValidatedDelinearization = false;
   if (Delinearize) {
     if (tryDelinearize(Src, Dst, Pair)) {
       LLVM_DEBUG(dbgs() << "    delinearized\n");
       Pairs = Pair.size();
+      HasValidatedDelinearization = !DisableDelinearizationChecks;
     }
   }
 
@@ -2810,6 +2856,19 @@ DependenceInfo::depends(Instruction *Src, Instruction *Dst,
     LLVM_DEBUG(dbgs() << "\tclass = " << Pair[P].Classification << "\n");
     LLVM_DEBUG(dbgs() << "\tloops = ");
     LLVM_DEBUG(dumpSmallBitVector(Pair[P].Loops));
+
+    // A validated delinearization is injective from its subscript tuple to the
+    // flat address. For a self-access, an injective subscript additionally
+    // proves that equality of this subscript requires equality in each loop
+    // used by that subscript.
+    if (Src == Dst && HasValidatedDelinearization &&
+        Pair[P].Src == Pair[P].Dst &&
+        isKnownInjectiveTwoLevelAddRec(Pair[P].Src, *SE, Src)) {
+      LLVM_DEBUG(dbgs() << "\tself subscript is injective\n");
+      for (unsigned Level : Pair[P].Loops.set_bits())
+        if (Level > 0 && Level <= CommonLevels)
+          Result.DV[Level - 1].Direction &= Dependence::DVEntry::EQ;
+    }
   }
 
   // Test each subscript individually

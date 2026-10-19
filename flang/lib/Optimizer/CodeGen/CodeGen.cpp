@@ -89,6 +89,9 @@ static llvm::cl::opt<bool> useNativeLogicalOps(
 // TODO: This should really be recovered from the specified target.
 static constexpr unsigned defaultAlign = 8;
 
+// Attribute name for array dimensions metadata.
+static constexpr llvm::StringLiteral arrayDimsAttrName = "llvm.array.dims";
+
 /// `fir.box` attribute values as defined for CFI_attribute_t in
 /// flang/ISO_Fortran_binding.h.
 static constexpr unsigned kAttrPointer = CFI_attribute_pointer;
@@ -101,6 +104,38 @@ static inline mlir::Type getLlvmPtrType(mlir::MLIRContext *context,
 
 static inline mlir::Type getI8Type(mlir::MLIRContext *context) {
   return mlir::IntegerType::get(context, 8);
+}
+
+/// Create array dimensions attribute for a fixed-size array type.
+/// Format: size per dimension.
+/// Returns empty ArrayAttr if not a fixed-size array.
+///
+/// NOTE: Fortran uses column-major layout, so dimensions are stored in
+/// reverse order in memory compared to source order. For example, Fortran
+/// REAL A(5,10) has shape [5,10] in source but memory layout [10 x [5 x ...]].
+/// We emit metadata in MEMORY LAYOUT ORDER to match delinearization
+/// expectations.
+static mlir::ArrayAttr createArrayDimsAttr(mlir::MLIRContext *context,
+                                           fir::SequenceType seqTy) {
+  // Only handle fixed-size arrays (no dynamic dimensions).
+  if (fir::hasDynamicSize(seqTy))
+    return mlir::ArrayAttr();
+
+  llvm::SmallVector<mlir::Attribute, 4> dims;
+  llvm::ArrayRef<int64_t> shape = seqTy.getShape();
+
+  // Emit in REVERSE order (memory layout order) for Fortran column-major
+  // layout.
+  for (int64_t size : llvm::reverse(shape)) {
+    mlir::IntegerAttr sizeAttr =
+        mlir::IntegerAttr::get(mlir::IntegerType::get(context, 64), size);
+    dims.push_back(sizeAttr);
+  }
+
+  if (dims.empty())
+    return mlir::ArrayAttr();
+
+  return mlir::ArrayAttr::get(context, dims);
 }
 
 /// Extract constant from a value that must be the result of one of the
@@ -3163,6 +3198,19 @@ struct InsertOnRangeOpConversion
 } // namespace
 
 namespace {
+/// Return true when \p extent is a compile-time constant greater than zero.
+/// Assumed-size arrays use fir.assumed_size_extent / -1 and must not get
+/// bounds assumes.
+static bool hasKnownPositiveConstantExtent(mlir::Value extent) {
+  if (llvm::isa_and_nonnull<fir::AssumedSizeExtentOp>(extent.getDefiningOp()))
+    return false;
+  if (auto constOp = extent.getDefiningOp<mlir::LLVM::ConstantOp>()) {
+    if (auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(constOp.getValue()))
+      return intAttr.getValue().isStrictlyPositive();
+  }
+  return false;
+}
+
 /// XArrayCoor is the address arithmetic on a dynamically shaped, sliced,
 /// shifted etc. array.
 /// (See the static restriction on coordinate_of.) array_coor determines the
@@ -3218,6 +3266,38 @@ struct XArrayCoorOpConversion
       mlir::Value lb =
           isShifted ? integerCast(loc, rewriter, idxTy, operands[shiftOffset])
                     : one;
+
+      // Emit array bounds assumes per Fortran 2018 standard section 9.5.3.3.2:
+      // "The value of each subscript expression shall be within the bounds for
+      // its dimension unless the array section has size zero."
+      // For non-boxed arrays with known shape, emit: assume(index >= lb) and
+      // assume(index <= lb + extent - 1).
+      // The llvm.array_bounds attribute marks these assumes for removal before
+      // vectorization to prevent IR bloat and avoid impacting cost models.
+      if (!baseIsBoxed && !coor.getShape().empty()) {
+        mlir::Value extent =
+            integerCast(loc, rewriter, idxTy, operands[shapeOffset]);
+        // Only emit assumes when the declared extent is a known positive
+        // constant. Assumed-size and other unbounded arrays use extent <= 0.
+        if (hasKnownPositiveConstantExtent(extent)) {
+          // Compute upper bound: ub = lb + extent - 1.
+          mlir::Value lbPlusExtent =
+              mlir::LLVM::AddOp::create(rewriter, loc, idxTy, lb, extent, nsw);
+          mlir::Value ub = mlir::LLVM::SubOp::create(rewriter, loc, idxTy,
+                                                     lbPlusExtent, one, nsw);
+          // Create bounds check conditions.
+          mlir::Value lbCheck = mlir::LLVM::ICmpOp::create(
+              rewriter, loc, mlir::LLVM::ICmpPredicate::sge, index, lb);
+          mlir::Value ubCheck = mlir::LLVM::ICmpOp::create(
+              rewriter, loc, mlir::LLVM::ICmpPredicate::sle, index, ub);
+          // Emit assumes for lower and upper bounds with array_bounds marker.
+          auto lbAssume = mlir::LLVM::AssumeOp::create(rewriter, loc, lbCheck);
+          lbAssume->setAttr("llvm.array_bounds", rewriter.getUnitAttr());
+          auto ubAssume = mlir::LLVM::AssumeOp::create(rewriter, loc, ubCheck);
+          ubAssume->setAttr("llvm.array_bounds", rewriter.getUnitAttr());
+        }
+      }
+
       mlir::Value step = one;
       bool normalSlice = isSliced;
       // Compute zero based index in dimension i of the element, applying
@@ -3865,6 +3945,14 @@ struct GlobalOpConversion : public fir::FIROpConversion<fir::GlobalOp> {
     // them; whilst taking care not to apply attributes that are lowered in
     // other ways.
     g->setDiscardableAttrs(global->getDiscardableAttrDictionary());
+
+    // Attach array dimensions for fixed-size arrays.
+    mlir::Type globalTy = global.getType();
+    if (auto seqTy = mlir::dyn_cast<fir::SequenceType>(globalTy)) {
+      if (mlir::ArrayAttr arrayDims =
+              createArrayDimsAttr(global.getContext(), seqTy))
+        g->setDiscardableAttr(arrayDimsAttrName, arrayDims);
+    }
 
     auto &gr = g.getInitializerRegion();
     rewriter.inlineRegionBefore(global.getRegion(), gr, gr.end());

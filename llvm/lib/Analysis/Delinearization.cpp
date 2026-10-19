@@ -19,8 +19,11 @@
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -392,9 +395,13 @@ void llvm::computeAccessFunctions(ScalarEvolution &SE, const SCEV *Expr,
     Subscripts.push_back(R);
   }
 
-  // Also push in last position the remainder of the last division: it will be
-  // the access function of the innermost dimension.
-  Subscripts.push_back(Res);
+  if (!Res->isZero()) {
+    // This is only needed when the outermost array size is not known.  Res = 0
+    // when the outermost array dimension is known, as for example when reading
+    // array sizes from a local or global declaration.
+    Subscripts.push_back(Res);
+    LLVM_DEBUG(dbgs() << "Subscripts push_back Res: " << *Res << "\n");
+  }
 
   std::reverse(Subscripts.begin(), Subscripts.end());
 
@@ -585,6 +592,79 @@ bool llvm::findFixedSizeArrayDimensions(ScalarEvolution &SE, const SCEV *Expr,
   return true;
 }
 
+static bool extractArrayShapeFromMetadata(
+    ScalarEvolution &SE, Value *BasePtr,
+    SmallVectorImpl<const SCEV *> &Sizes, const SCEV *ElementSize) {
+  MDNode *ArrayDimsMD = nullptr;
+  Type *ObjectTy = nullptr;
+  if (auto *GV = dyn_cast<GlobalVariable>(BasePtr)) {
+    ArrayDimsMD = GV->getMetadata(LLVMContext::MD_array_dims);
+    ObjectTy = GV->getValueType();
+  } else if (auto *AI = dyn_cast<AllocaInst>(BasePtr)) {
+    ArrayDimsMD = AI->getMetadata(LLVMContext::MD_array_dims);
+    ObjectTy = AI->getAllocatedType();
+  } else {
+    LLVM_DEBUG(dbgs() << "Base pointer cannot carry array.dims metadata\n");
+    return false;
+  }
+
+  if (!ArrayDimsMD) {
+    LLVM_DEBUG(dbgs() << "No array.dims metadata found\n");
+    return false;
+  }
+
+  SmallVector<uint64_t, 4> MetadataSizes;
+  MetadataSizes.reserve(ArrayDimsMD->getNumOperands());
+  for (const MDOperand &Operand : ArrayDimsMD->operands()) {
+    auto *SizeMD = mdconst::dyn_extract<ConstantInt>(Operand);
+    if (!SizeMD || !SizeMD->getType()->isIntegerTy(64) ||
+        SizeMD->isNegative() || SizeMD->isZero()) {
+      LLVM_DEBUG(dbgs() << "Malformed array.dims metadata\n");
+      return false;
+    }
+    MetadataSizes.push_back(SizeMD->getZExtValue());
+  }
+  if (MetadataSizes.empty())
+    return false;
+
+  // The metadata describes the declared shape in memory-layout order. Verify
+  // that it agrees with the array type before using it for dependence proofs.
+  Type *Ty = ObjectTy;
+  for (uint64_t Size : MetadataSizes) {
+    auto *ArrayTy = dyn_cast<ArrayType>(Ty);
+    if (!ArrayTy || ArrayTy->getNumElements() != Size) {
+      LLVM_DEBUG(dbgs() << "array.dims metadata does not match object type\n");
+      return false;
+    }
+    Ty = ArrayTy->getElementType();
+  }
+  if (isa<ArrayType>(Ty)) {
+    LLVM_DEBUG(dbgs() << "array.dims metadata has too few dimensions\n");
+    return false;
+  }
+
+  Type *SizeTy = ElementSize->getType();
+  unsigned SizeBitWidth = SizeTy->getIntegerBitWidth();
+  Sizes.clear();
+  for (uint64_t Size : MetadataSizes) {
+    if (APInt(64, Size).getActiveBits() > SizeBitWidth) {
+      Sizes.clear();
+      return false;
+    }
+    Sizes.push_back(SE.getConstant(SizeTy, Size));
+  }
+  Sizes.push_back(ElementSize);
+
+  LLVM_DEBUG({
+    dbgs() << "Extracted complete array shape from metadata for " << *BasePtr
+           << "\nDimensions: ";
+    for (const SCEV *Size : Sizes)
+      dbgs() << *Size << " ";
+    dbgs() << "\n";
+  });
+  return true;
+}
+
 /// Splits the SCEV into two vectors of SCEVs representing the subscripts and
 /// sizes of an array access, assuming that the array is a fixed size array.
 ///
@@ -639,31 +719,101 @@ bool llvm::findFixedSizeArrayDimensions(ScalarEvolution &SE, const SCEV *Expr,
 bool llvm::delinearizeFixedSizeArray(ScalarEvolution &SE, const SCEV *Expr,
                                      SmallVectorImpl<const SCEV *> &Subscripts,
                                      SmallVectorImpl<const SCEV *> &Sizes,
-                                     const SCEV *ElementSize) {
+                                     const SCEV *ElementSize,
+                                     DelinearizationShapeKind &ShapeKind) {
   // Clear output vectors.
   Subscripts.clear();
   Sizes.clear();
+  ShapeKind = DelinearizationShapeKind::UnknownOuterDimension;
 
-  // First step: find the fixed array size.
-  SmallVector<uint64_t, 4> ConstSizes;
-  if (!findFixedSizeArrayDimensions(SE, Expr, ConstSizes, ElementSize)) {
-    Sizes.clear();
-    return false;
+  const SCEVUnknown *BasePointer =
+      dyn_cast<SCEVUnknown>(SE.getPointerBase(Expr));
+  const SCEV *Offset = BasePointer ? SE.getMinusSCEV(Expr, BasePointer) : Expr;
+
+  LLVM_DEBUG(
+      dbgs() << "delinearizeFixedSizeArray, analysing expr: ";
+      Expr->dump();
+  );
+
+  // Prefer an explicitly-described array shape. Unlike stride inference, this
+  // also works when an access contains symbolic strides.
+  bool FoundSizesFromMetadata =
+      BasePointer && extractArrayShapeFromMetadata(
+                         SE, BasePointer->getValue(), Sizes, ElementSize);
+
+  if (!FoundSizesFromMetadata) {
+    // Otherwise infer the fixed array size from the access expression.
+    SmallVector<uint64_t, 4> ConstSizes;
+    if (!findFixedSizeArrayDimensions(SE, Offset, ConstSizes, ElementSize)) {
+      Sizes.clear();
+      return false;
+    }
+
+    // Convert the constant size to SCEV.
+    for (uint64_t Size : ConstSizes)
+      Sizes.push_back(SE.getConstant(Offset->getType(), Size));
+  } else {
+    ShapeKind = DelinearizationShapeKind::Complete;
   }
 
-  // Convert the constant size to SCEV.
-  for (uint64_t Size : ConstSizes)
-    Sizes.push_back(SE.getConstant(Expr->getType(), Size));
-
   // Second step: compute the access functions for each subscript.
-  computeAccessFunctions(SE, Expr, Subscripts, Sizes);
+  computeAccessFunctions(SE, Offset, Subscripts, Sizes);
 
   return !Subscripts.empty();
 }
 
+static bool isKnownInRange(ScalarEvolution &SE, const SCEV *Subscript,
+                           const SCEV *Size, const Instruction *CtxI) {
+  Type *WiderTy = SE.getWiderType(Subscript->getType(), Size->getType());
+  Subscript = SE.getNoopOrSignExtend(Subscript, WiderTy);
+  Size = SE.getNoopOrSignExtend(Size, WiderTy);
+
+  auto IsKnownPredicate = [&](CmpPredicate Pred, const SCEV *LHS,
+                              const SCEV *RHS) {
+    return CtxI ? SE.isKnownPredicateAt(Pred, LHS, RHS, CtxI)
+                : SE.isKnownPredicate(Pred, LHS, RHS);
+  };
+
+  const SCEV *Zero = SE.getZero(WiderTy);
+  if (IsKnownPredicate(ICmpInst::ICMP_SGE, Subscript, Zero) &&
+      IsKnownPredicate(ICmpInst::ICMP_SLT, Subscript, Size))
+    return true;
+  if (IsKnownPredicate(ICmpInst::ICMP_SGT, Size, Zero) &&
+      IsKnownPredicate(ICmpInst::ICMP_ULT, Subscript, Size))
+    return true;
+
+  // Frontends for one-based languages naturally express the equivalent range
+  // on Subscript + 1. Accept both the signed form 1 <= X <= Size and Flang's
+  // unsigned form X != 0 && X <u Size + 1.
+  const SCEV *OneBased =
+      SE.getAddExpr(Subscript, SE.getOne(Subscript->getType()));
+  if (IsKnownPredicate(ICmpInst::ICMP_SGT, OneBased, Zero) &&
+      IsKnownPredicate(ICmpInst::ICMP_SLE, OneBased, Size))
+    return true;
+  const SCEV *SizePlusOne =
+      SE.getAddExpr(Size, SE.getOne(Size->getType()));
+  return IsKnownPredicate(ICmpInst::ICMP_NE, OneBased, Zero) &&
+         IsKnownPredicate(ICmpInst::ICMP_ULT, OneBased, SizePlusOne);
+}
+
 bool llvm::validateDelinearizationResult(ScalarEvolution &SE,
                                          ArrayRef<const SCEV *> Sizes,
-                                         ArrayRef<const SCEV *> Subscripts) {
+                                         ArrayRef<const SCEV *> Subscripts,
+                                         DelinearizationShapeKind ShapeKind,
+                                         const Instruction *CtxI) {
+  // With an unknown outer dimension there is one size per subscript. When
+  // metadata describes the complete array shape, Sizes additionally contains
+  // the known outer dimension.
+  bool HasKnownOuterDimension =
+      ShapeKind == DelinearizationShapeKind::Complete;
+  size_t ExpectedSizeCount =
+      Subscripts.size() + (HasKnownOuterDimension ? 1 : 0);
+  if (Sizes.size() != ExpectedSizeCount || Subscripts.empty()) {
+    LLVM_DEBUG(dbgs() << "Delinearization validation failed: incompatible "
+                         "size and subscript counts\n");
+    return false;
+  }
+
   // Sizes and Subscripts are as follows:
   //
   //   Sizes:      [UNK][S_2]...[S_n]
@@ -672,34 +822,54 @@ bool llvm::validateDelinearizationResult(ScalarEvolution &SE,
   // where the size of the outermost dimension is unknown (UNK).
 
   auto AddOverflow = [&](const SCEV *A, const SCEV *B) -> const SCEV * {
-    if (!SE.willNotOverflow(Instruction::Add, /*IsSigned=*/true, A, B))
+    if (!SE.willNotOverflow(Instruction::Add, /*IsSigned=*/true, A, B, CtxI))
       return nullptr;
     return SE.getAddExpr(A, B);
   };
 
   auto MulOverflow = [&](const SCEV *A, const SCEV *B) -> const SCEV * {
-    if (!SE.willNotOverflow(Instruction::Mul, /*IsSigned=*/true, A, B))
+    if (!SE.willNotOverflow(Instruction::Mul, /*IsSigned=*/true, A, B, CtxI))
       return nullptr;
     return SE.getMulExpr(A, B);
   };
 
-  // Range check: 0 <= I_k < S_k for k = 2..n.
-  for (size_t I = 1; I < Sizes.size(); ++I) {
-    const SCEV *Size = Sizes[I - 1];
-    const SCEV *Subscript = Subscripts[I];
-    if (!SE.isKnownNonNegative(Subscript))
-      return false;
+  auto IsKnownPredicate = [&](CmpPredicate Pred, const SCEV *LHS,
+                              const SCEV *RHS) {
+    return CtxI ? SE.isKnownPredicateAt(Pred, LHS, RHS, CtxI)
+                : SE.isKnownPredicate(Pred, LHS, RHS);
+  };
 
-    // TODO: It may be better that delinearization itself unifies the types of
-    // all elements in Sizes and Subscripts.
-    Type *WiderTy = SE.getWiderType(Subscript->getType(), Size->getType());
-    Subscript = SE.getNoopOrSignExtend(Subscript, WiderTy);
-    Size = SE.getNoopOrSignExtend(Size, WiderTy);
-    if (!SE.isKnownPredicate(ICmpInst::ICMP_SLT, Subscript, Size)) {
-      LLVM_DEBUG(dbgs() << "Range check failed: " << *Subscript << " <s "
-                        << *Size << "\n");
+  // Range check all dimensions whose sizes are known. Skip I_1 when the
+  // outermost dimension is unknown.
+  size_t FirstSubscript = HasKnownOuterDimension ? 0 : 1;
+  for (size_t I = FirstSubscript; I < Subscripts.size(); ++I) {
+    const SCEV *Size = Sizes[HasKnownOuterDimension ? I : I - 1];
+    const SCEV *Subscript = Subscripts[I];
+
+    if (!isKnownInRange(SE, Subscript, Size, CtxI)) {
+      LLVM_DEBUG(dbgs() << "Range check failed: could not prove 0 <= "
+                        << *Subscript << " < " << *Size << "\n");
       return false;
     }
+  }
+
+  if (HasKnownOuterDimension) {
+    // Every subscript is bounded by a known dimension, so the byte offset is
+    // in [0, product(Sizes)). Prove that the complete object size itself is
+    // representable instead of multiplying an unknown subscript expression.
+    const SCEV *ObjectSize = SE.getOne(Sizes[0]->getType());
+    for (const SCEV *Size : Sizes) {
+      if (!IsKnownPredicate(ICmpInst::ICMP_SGT, Size,
+                            SE.getZero(Size->getType())))
+        return false;
+      ObjectSize = MulOverflow(ObjectSize, Size);
+      if (!ObjectSize) {
+        LLVM_DEBUG(dbgs() << "Delinearization validation failed: object size "
+                             "may overflow\n");
+        return false;
+      }
+    }
+    return true;
   }
 
   // The offset computation is as follows:
@@ -728,21 +898,33 @@ bool llvm::validateDelinearizationResult(ScalarEvolution &SE,
   const SCEV *Prod = SE.getOne(Sizes[0]->getType());
   for (const SCEV *Size : Sizes) {
     Prod = MulOverflow(Prod, Size);
-    if (!Prod)
+    if (!Prod) {
+      LLVM_DEBUG(dbgs() << "Delinearization validation failed: dimension "
+                           "product may overflow\n");
       return false;
+    }
   }
   const SCEV *Min = MulOverflow(Prod, Subscripts[0]);
-  if (!Min)
+  if (!Min) {
+    LLVM_DEBUG(dbgs() << "Delinearization validation failed: minimum offset "
+                         "may overflow\n");
     return false;
+  }
 
   // We have already checked that Min and Prod don't overflow, so it's enough
   // to check whether Min + Prod - 1 doesn't overflow.
   const SCEV *MaxPlusOne = AddOverflow(Min, Prod);
-  if (!MaxPlusOne)
+  if (!MaxPlusOne) {
+    LLVM_DEBUG(dbgs() << "Delinearization validation failed: maximum offset "
+                         "may overflow\n");
     return false;
+  }
   if (!SE.willNotOverflow(Instruction::Sub, /*IsSigned=*/true, MaxPlusOne,
-                          SE.getOne(MaxPlusOne->getType())))
+                          SE.getOne(MaxPlusOne->getType()), CtxI)) {
+    LLVM_DEBUG(dbgs() << "Delinearization validation failed: final offset "
+                         "subtraction may overflow\n");
     return false;
+  }
 
   return true;
 }
@@ -821,25 +1003,37 @@ void printDelinearization(raw_ostream &O, Function *F, LoopInfo *LI,
     // Do not delinearize if we cannot find the base pointer.
     if (!BasePointer)
       break;
-    AccessFn = SE->getMinusSCEV(AccessFn, BasePointer);
 
+    const SCEV *Offset = SE->getMinusSCEV(AccessFn, BasePointer);
     O << "\n";
     O << "Inst:" << Inst << "\n";
-    O << "AccessFunction: " << *AccessFn << "\n";
+    O << "AccessFunction: " << *Offset << "\n";
 
     SmallVector<const SCEV *, 3> Subscripts, Sizes;
 
     auto IsDelinearizationFailed = [&]() {
-      return Subscripts.size() == 0 || Sizes.size() == 0 ||
-             Subscripts.size() != Sizes.size();
+      return Subscripts.size() == 0 || Sizes.size() == 0;
     };
 
-    delinearize(*SE, AccessFn, Subscripts, Sizes, SE->getElementSize(&Inst));
+    DelinearizationShapeKind ShapeKind =
+        DelinearizationShapeKind::UnknownOuterDimension;
+    if (UseFixedSizeArrayHeuristic) {
+      delinearizeFixedSizeArray(*SE, AccessFn, Subscripts, Sizes,
+                                SE->getElementSize(&Inst), ShapeKind);
+      if (ShapeKind != DelinearizationShapeKind::Complete) {
+        Subscripts.clear();
+        Sizes.clear();
+      }
+    }
+
+    if (IsDelinearizationFailed())
+      delinearize(*SE, Offset, Subscripts, Sizes, SE->getElementSize(&Inst));
+
     if (UseFixedSizeArrayHeuristic && IsDelinearizationFailed()) {
       Subscripts.clear();
       Sizes.clear();
       delinearizeFixedSizeArray(*SE, AccessFn, Subscripts, Sizes,
-                                SE->getElementSize(&Inst));
+                                SE->getElementSize(&Inst), ShapeKind);
     }
 
     if (IsDelinearizationFailed()) {
@@ -848,18 +1042,34 @@ void printDelinearization(raw_ostream &O, Function *F, LoopInfo *LI,
     }
 
     O << "Base offset: " << *BasePointer << "\n";
-    O << "ArrayDecl[UnknownSize]";
-    int Size = Subscripts.size();
-    for (int i = 0; i < Size - 1; i++)
-      O << "[" << *Sizes[i] << "]";
-    O << " with elements of " << *Sizes[Size - 1] << " bytes.\n";
+    O << "ArrayDecl";
+
+    // Print [Unknown] when the outermost dimension of the array is not known.
+    // Sizes[NumSizes - 1] is the array element size.
+    int NumSubscripts = Subscripts.size();
+    int NumSizes = Sizes.size();
+    if (NumSizes == NumSubscripts)
+      O << "[UnknownSize]";
+
+    // Handle different size relationships between Subscripts and Sizes.
+    if (NumSizes > 0) {
+      // Print array dimensions (all but the last, which is element size).
+      for (const SCEV *Size : ArrayRef(Sizes).drop_back())
+        O << "[" << *Size << "]";
+
+      // Print element size (last element in Sizes array).
+      O << " with elements of " << *Sizes[NumSizes - 1] << " bytes.\n";
+    } else {
+      O << " unknown sizes.\n";
+    }
 
     O << "ArrayRef";
-    for (int i = 0; i < Size; i++)
+    for (int i = 0; i < NumSubscripts; i++)
       O << "[" << *Subscripts[i] << "]";
     O << "\n";
 
-    bool IsValid = validateDelinearizationResult(*SE, Sizes, Subscripts);
+    bool IsValid = validateDelinearizationResult(
+        *SE, Sizes, Subscripts, ShapeKind, &Inst);
     O << "Delinearization validation: " << (IsValid ? "Succeeded" : "Failed")
       << "\n";
   }

@@ -860,12 +860,28 @@ bool SimplifyIndvar::strengthenRightShift(BinaryOperator *BO,
   return false;
 }
 
+/// Return true when I is the predicate of an array-bound assumption.  These
+/// predicates remain available to AssumptionCache and ScalarEvolution, but
+/// should not drive induction-variable rewriting.
+static bool isArrayBoundsAssumePredicate(Instruction *I) {
+  for (User *U : I->users()) {
+    auto *Assume = dyn_cast<AssumeInst>(U);
+    if (Assume && Assume->getArgOperand(0) == I &&
+        Assume->getMetadata("llvm.array.bounds"))
+      return true;
+  }
+  return false;
+}
+
 /// Add all uses of Def to the current IV's worklist.
 void SimplifyIndvar::pushIVUsers(
     Instruction *Def, SmallPtrSet<Instruction *, 16> &Simplified,
     SmallVectorImpl<std::pair<Instruction *, Instruction *>> &SimpleIVUsers) {
   for (User *U : Def->users()) {
     Instruction *UI = cast<Instruction>(U);
+
+    if (isArrayBoundsAssumePredicate(UI))
+      continue;
 
     // Avoid infinite or exponential worklist processing.
     // Also ensure unique worklist users.

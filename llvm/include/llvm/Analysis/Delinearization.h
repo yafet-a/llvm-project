@@ -25,6 +25,13 @@ class Instruction;
 class ScalarEvolution;
 class SCEV;
 
+/// Describes whether Sizes includes every declared dimension or omits an
+/// unknown outermost dimension inferred from a flattened access.
+enum class DelinearizationShapeKind {
+  UnknownOuterDimension,
+  Complete,
+};
+
 /// Compute the array dimensions Sizes from the set of Terms extracted from
 /// the memory access function of this SCEVAddRecExpr (second step of
 /// delinearization).
@@ -62,9 +69,6 @@ LLVM_ABI void computeAccessFunctions(ScalarEvolution &SE, const SCEV *Expr,
 /// object, one can collect in step 1 all the step terms for all the memory
 /// accesses, and compute in step 2 a unique array shape. This guarantees
 /// that the array shape will be the same across all memory accesses.
-///
-/// FIXME: We could derive the result of steps 1 and 2 from a description of
-/// the array shape given in metadata.
 ///
 /// Example:
 ///
@@ -130,9 +134,12 @@ LLVM_ABI bool findFixedSizeArrayDimensions(ScalarEvolution &SE,
 /// 1. Compute the array size
 /// 2. Compute the access function: same as normal delinearization
 ///
-/// Different from the normal delinearization, this function assumes that NO
-/// terms exist in the \p Expr. In other words, it assumes that the all step
-/// values are constant.
+/// When the base object carries a complete array shape, that shape is used
+/// directly and symbolic step values are supported. Otherwise, this function
+/// falls back to inferring dimensions from constant step values.
+///
+/// \p ShapeKind reports whether all dimensions came from an explicitly
+/// described shape or whether the outermost dimension remains unknown.
 ///
 /// This function is intended to replace getIndexExpressionsFromGEP. They rely
 /// on the GEP source element type so that will be removed in the future.
@@ -140,14 +147,19 @@ LLVM_ABI bool
 delinearizeFixedSizeArray(ScalarEvolution &SE, const SCEV *Expr,
                           SmallVectorImpl<const SCEV *> &Subscripts,
                           SmallVectorImpl<const SCEV *> &Sizes,
-                          const SCEV *ElementSize);
+                          const SCEV *ElementSize,
+                          DelinearizationShapeKind &ShapeKind);
 
 /// Check that each subscript in \p Subscripts is within the corresponding size
 /// in \p Sizes. For the outermost dimension, the subscript being negative is
-/// allowed.
+/// allowed when \p ShapeKind says its size is unknown. If \p CtxI is provided,
+/// facts that dominate that instruction may be used to validate the
+/// subscripts.
 LLVM_ABI bool validateDelinearizationResult(ScalarEvolution &SE,
                                             ArrayRef<const SCEV *> Sizes,
-                                            ArrayRef<const SCEV *> Subscripts);
+                                            ArrayRef<const SCEV *> Subscripts,
+                                            DelinearizationShapeKind ShapeKind,
+                                            const Instruction *CtxI = nullptr);
 
 /// Gathers the individual index expressions from a GEP instruction.
 ///
