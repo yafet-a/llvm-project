@@ -677,11 +677,21 @@ private:
     }
   }
 
-  /// Determine if it is beneficial to fuse two loops.
-  bool isBeneficialFusion(unsigned ReusedValueCount) const {
+  /// Determine if it is beneficial to fuse two loops. If it is not, update
+  /// statistics and emit a missed remark explaining why.
+  bool isBeneficialFusion(const FusionCandidate &FC0,
+                          const FusionCandidate &FC1,
+                          unsigned ReusedValueCount) {
     if (Opts.loop_fusion_disable_cost_model)
       return true;
-    return ReusedValueCount >= Opts.loop_fusion_min_reused_values;
+
+    if (ReusedValueCount < Opts.loop_fusion_min_reused_values) {
+      ++InsufficientReuse;
+      reportFusionInsufficientReuse(FC0, FC1, ReusedValueCount);
+      return false;
+    }
+
+    return true;
   }
 
   /// Computes the integer difference in trip counts:
@@ -958,15 +968,12 @@ private:
           }
         }
 
-        unsigned ReusedValueCount = ReusedValues.size();
-        bool BeneficialToFuse = isBeneficialFusion(ReusedValueCount);
+        bool BeneficialToFuse =
+            isBeneficialFusion(FC0, FC1, ReusedValues.size());
         LLVM_DEBUG(dbgs() << "\tFusion appears to be "
                           << (BeneficialToFuse ? "" : "un") << "profitable!\n");
-        if (!BeneficialToFuse) {
-          ++InsufficientReuse;
-          reportFusionInsufficientReuse(FC0, FC1, ReusedValueCount);
+        if (!BeneficialToFuse)
           continue;
-        }
 
         // All analysis has completed and has determined that fusion is legal
         // and profitable. At this point, start transforming the code and
