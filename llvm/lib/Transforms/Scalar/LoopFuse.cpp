@@ -60,7 +60,6 @@
 #include "llvm/Analysis/PostDominators.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
-#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/Analysis/VectorUtils.h"
 #include "llvm/IR/Function.h"
@@ -568,22 +567,17 @@ private:
   OptimizationRemarkEmitter &ORE;
   AssumptionCache &AC;
   const TargetTransformInfo &TTI;
-  const TargetLibraryInfo &TLI;
   LoopAccessInfoManager &LAIs;
-
-  /// Loops rewritten by fusion. LAIs may still hold their pre-fusion
-  /// LoopAccessInfo, because fusion keeps the first candidate's Loop object.
-  SmallPtrSet<const Loop *, 4> FusedLoops;
 
 public:
   LoopFuser(const ScalarOptions &Opts, LoopInfo &LI, DominatorTree &DT,
             DependenceInfo &DI, AAResults &AA, ScalarEvolution &SE,
             PostDominatorTree &PDT, OptimizationRemarkEmitter &ORE,
             AssumptionCache &AC, const TargetTransformInfo &TTI,
-            const TargetLibraryInfo &TLI, LoopAccessInfoManager &LAIs)
+            LoopAccessInfoManager &LAIs)
       : Opts(Opts), LDT(LI), DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy),
         LI(LI), DT(DT), DI(DI), AA(AA), SE(SE), PDT(PDT), ORE(ORE), AC(AC),
-        TTI(TTI), TLI(TLI), LAIs(LAIs) {}
+        TTI(TTI), LAIs(LAIs) {}
 
   /// This is the main entry point for loop fusion. It will traverse the
   /// specified function and collect candidate loops to fuse, starting at the
@@ -728,15 +722,7 @@ private:
     if (!L.isInnermost())
       return false;
 
-    std::optional<LoopAccessInfo> FusedLAI;
-    const LoopAccessInfo *LAI;
-    if (FusedLoops.contains(&L)) {
-      // LAIs may cache a pre-fusion result for L; analyze the fused loop.
-      FusedLAI.emplace(&L, &SE, &TTI, &TLI, &AA, &DT, &LI, &AC);
-      LAI = &*FusedLAI;
-    } else {
-      LAI = &LAIs.getInfo(L);
-    }
+    const LoopAccessInfo *LAI = &LAIs.getInfo(L);
     if (!LAI->canVectorizeMemory())
       return false;
 
@@ -1058,10 +1044,12 @@ private:
         reportLoopFusion<OptimizationRemark>((Peel ? FC0Copy : FC0), FC1,
                                              "FuseCounter", "Loops fused");
 
+        // Fusion keeps the first candidate's Loop object and deletes the
+        // second, so neither can keep its cached LoopAccessInfo.
+        LAIs.erase(*FC0.L);
+        LAIs.erase(*FC1.L);
         FusionCandidate FusedCand(performFusion((Peel ? FC0Copy : FC0), FC1),
                                   DT, &PDT, ORE, FC0Copy.PP);
-        LAIs.clear();
-        FusedLoops.insert(FusedCand.L);
         FusedCand.verify();
         assert(FusedCand.isEligibleForFusion(SE) &&
                "Fused candidate should be eligible for fusion!");
@@ -2120,10 +2108,9 @@ PreservedAnalyses LoopFusePass::run(Function &F, FunctionAnalysisManager &AM) {
   if (Changed)
     PDT.recalculate(F);
 
-  auto &TLI = AM.getResult<TargetLibraryAnalysis>(F);
   auto &LAIs = AM.getResult<LoopAccessAnalysis>(F);
   LoopFuser LF(ScalarOptions::Global, LI, DT, DI, AA, SE, PDT, ORE, AC, TTI,
-               TLI, LAIs);
+               LAIs);
   Changed |= LF.fuseLoops(F);
   if (!Changed)
     return PreservedAnalyses::all();
