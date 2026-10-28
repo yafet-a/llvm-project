@@ -1035,6 +1035,10 @@ public:
 
   LLVM_ABI void clear();
 
+  /// Drop the cached LoopAccessInfo for \p L, if any. Use this for loops
+  /// whose body a transform has rewritten.
+  void erase(Loop &L) { LoopAccessInfoMap.erase(&L); }
+
   LLVM_ABI bool invalidate(Function &F, const PreservedAnalyses &PA,
                            FunctionAnalysisManager::Invalidator &Inv);
 };
