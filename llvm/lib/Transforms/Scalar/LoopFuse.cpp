@@ -725,6 +725,9 @@ private:
   /// need gathers and scatters, are rarely widened, and are therefore treated
   /// as non-vectorizable.
   bool isLikelyVectorizable(Loop &L) {
+    if (!L.isInnermost())
+      return false;
+
     std::optional<LoopAccessInfo> FusedLAI;
     const LoopAccessInfo *LAI;
     if (FusedLoops.contains(&L)) {
