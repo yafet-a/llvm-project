@@ -49,22 +49,70 @@ define i32 @mem_access(ptr %p) {
   ret i32 %w
 }
 
-; Check that the calls are CSEd because of the conservative treatment of operand
-; bundles.
-; TODO: Perhaps this can be made more precise by including the bundle name in
-; the value numbering expression.
+; Check that the calls are CSEd because they do not access memory and have
+; identical operand bundles.
 define i32 @no_mem_access(ptr %p) {
 ; CHECK-LABEL: define i32 @no_mem_access(
 ; CHECK-SAME: ptr [[P:%.*]]) {
 ; CHECK-NEXT:    [[U:%.*]] = call i32 @g(i1 true) #[[ATTR1]] [ "align"(ptr [[P]], i32 8) ]
-; CHECK-NEXT:    [[V:%.*]] = call i32 @g(i1 true) #[[ATTR1]] [ "align"(ptr [[P]], i32 8) ]
-; CHECK-NEXT:    [[W:%.*]] = add i32 [[U]], [[V]]
+; CHECK-NEXT:    [[W:%.*]] = add i32 [[U]], [[U]]
 ; CHECK-NEXT:    ret i32 [[W]]
 ;
   %u = call i32 @g(i1 true) memory(none) ["align"(ptr %p, i32 8)]
   %v = call i32 @g(i1 true) memory(none) ["align"(ptr %p, i32 8)]
   %w = add i32 %u, %v
   ret i32 %w
+}
+
+; Check that the calls are not CSEd because their bundle operands are grouped
+; differently.
+define i32 @diff_grouping(ptr %p) {
+; CHECK-LABEL: define i32 @diff_grouping(
+; CHECK-SAME: ptr [[P:%.*]]) {
+; CHECK-NEXT:    [[U:%.*]] = call i32 @g(i1 true) #[[ATTR1]] [ "foo"(ptr [[P]]), "foo"(ptr [[P]]) ]
+; CHECK-NEXT:    [[V:%.*]] = call i32 @g(i1 true) #[[ATTR1]] [ "foo"(ptr [[P]], ptr [[P]]) ]
+; CHECK-NEXT:    [[W:%.*]] = add i32 [[U]], [[V]]
+; CHECK-NEXT:    ret i32 [[W]]
+;
+  %u = call i32 @g(i1 true) memory(none) ["foo"(ptr %p), "foo"(ptr %p)]
+  %v = call i32 @g(i1 true) memory(none) ["foo"(ptr %p, ptr %p)]
+  %w = add i32 %u, %v
+  ret i32 %w
+}
+
+; Check that a call with operand bundles is phi-translated and found fully
+; redundant.
+define i32 @phi_translate(i1 %c, ptr %p, ptr %q) {
+; CHECK-LABEL: define i32 @phi_translate(
+; CHECK-SAME: i1 [[C:%.*]], ptr [[P:%.*]], ptr [[Q:%.*]]) {
+; CHECK-NEXT:  [[ENTRY:.*:]]
+; CHECK-NEXT:    br i1 [[C]], label %[[THEN:.*]], label %[[ELSE:.*]]
+; CHECK:       [[THEN]]:
+; CHECK-NEXT:    [[U:%.*]] = call i32 @g(i1 true) #[[ATTR1]] [ "foo"(ptr [[P]]) ]
+; CHECK-NEXT:    br label %[[JOIN:.*]]
+; CHECK:       [[ELSE]]:
+; CHECK-NEXT:    [[W:%.*]] = call i32 @g(i1 true) #[[ATTR1]] [ "foo"(ptr [[Q]]) ]
+; CHECK-NEXT:    br label %[[JOIN]]
+; CHECK:       [[JOIN]]:
+; CHECK-NEXT:    [[V_PRE_PHI:%.*]] = phi i32 [ [[W]], %[[ELSE]] ], [ [[U]], %[[THEN]] ]
+; CHECK-NEXT:    [[R:%.*]] = phi ptr [ [[P]], %[[THEN]] ], [ [[Q]], %[[ELSE]] ]
+; CHECK-NEXT:    ret i32 [[V_PRE_PHI]]
+;
+entry:
+  br i1 %c, label %then, label %else
+
+then:
+  %u = call i32 @g(i1 true) memory(none) ["foo"(ptr %p)]
+  br label %join
+
+else:
+  %w = call i32 @g(i1 true) memory(none) ["foo"(ptr %q)]
+  br label %join
+
+join:
+  %r = phi ptr [ %p, %then ], [ %q, %else ]
+  %v = call i32 @g(i1 true) memory(none) ["foo"(ptr %r)]
+  ret i32 %v
 }
 
 declare void @g(i1) nounwind willreturn

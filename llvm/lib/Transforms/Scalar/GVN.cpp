@@ -116,6 +116,8 @@ struct llvm::GVNValueTable::Expression {
   // any additional type needed to disambiguate the expression.
   Type *Ty = nullptr;
   SmallVector<uint32_t, 4> VarArgs;
+  // Bundle tags and operand counts. These are not value numbers.
+  SmallVector<uint32_t, 0> BundleLayout;
 
   AttributeList Attrs;
 
@@ -129,6 +131,8 @@ struct llvm::GVNValueTable::Expression {
     if (Ty != Other.Ty)
       return false;
     if (VarArgs != Other.VarArgs)
+      return false;
+    if (BundleLayout != Other.BundleLayout)
       return false;
     if ((!Attrs.isEmpty() || !Other.Attrs.isEmpty()) &&
         !Attrs.intersectWith(Ty->getContext(), Other.Attrs).has_value())
@@ -626,6 +630,10 @@ GVNValueTable::Expression GVNValueTable::createExpr(Instruction *I) {
     E.VarArgs.append(ShuffleMask.begin(), ShuffleMask.end());
   } else if (auto *CB = dyn_cast<CallBase>(I)) {
     E.Attrs = CB->getAttributes();
+    for (const CallBase::BundleOpInfo &BOI : CB->bundle_op_infos()) {
+      E.BundleLayout.push_back(BOI.Tag->getValue());
+      E.BundleLayout.push_back(BOI.End - BOI.Begin);
+    }
   }
 
   return E;
@@ -763,10 +771,7 @@ uint32_t GVNValueTable::lookupOrAddCall(CallInst *C) {
     return NextValueNumber++;
   }
 
-  // Conservatively assign unique value numbers to calls with operand bundles.
-  // TODO: Bundle names could be included in the value numbering expression to
-  // allow combining calls with identical bundles.
-  if (C->hasOperandBundles()) {
+  if (C->hasOperandBundles() && !AA->doesNotAccessMemory(C)) {
     ValueNumbering[C] = NextValueNumber;
     return NextValueNumber++;
   }
