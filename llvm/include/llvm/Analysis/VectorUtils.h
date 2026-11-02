@@ -696,6 +696,9 @@ public:
 
   ~InterleavedAccessInfo() { invalidateGroups(); }
 
+  /// Returns true if \p Stride is allowed in an interleaved group.
+  LLVM_ABI static bool isStrided(int Stride);
+
   /// Analyze the interleaved accesses and collect them in interleave
   /// groups. Substitute symbolic strides using \p Strides.
   /// Consider also predicated loads/stores in the analysis if
@@ -839,9 +842,6 @@ private:
       MapVector<Instruction *, StrideDescriptor> &AccessStrideInfo,
       const SymbolicStrideMap &Strides,
       SmallVectorImpl<const SCEVPredicate *> *Predicates);
-
-  /// Returns true if \p Stride is allowed in an interleaved group.
-  LLVM_ABI static bool isStrided(int Stride);
 
   /// Returns true if \p BB is a predicated block.
   bool isPredicated(BasicBlock *BB) const {

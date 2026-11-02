@@ -53,6 +53,7 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
 #include "llvm/Analysis/DomTreeUpdater.h"
+#include "llvm/Analysis/LoopAccessAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopNestAnalysis.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
@@ -60,6 +61,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/VectorUtils.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/Debug.h"
@@ -93,6 +95,9 @@ STATISTIC(
     "Loop has a non-empty preheader with instructions that cannot be moved");
 STATISTIC(InsufficientReuse,
           "Fusion has insufficient cross-loop reused values");
+STATISTIC(
+    MixedVectorizability,
+    "Fusion would merge a vectorizable loop with a non-vectorizable loop");
 STATISTIC(NonIdenticalGuards, "Candidates have different guards");
 STATISTIC(NonEmptyExitBlock, "Candidate has a non-empty exit block with "
                              "instructions that cannot be moved");
@@ -562,15 +567,17 @@ private:
   OptimizationRemarkEmitter &ORE;
   AssumptionCache &AC;
   const TargetTransformInfo &TTI;
+  LoopAccessInfoManager &LAIs;
 
 public:
   LoopFuser(const ScalarOptions &Opts, LoopInfo &LI, DominatorTree &DT,
             DependenceInfo &DI, AAResults &AA, ScalarEvolution &SE,
             PostDominatorTree &PDT, OptimizationRemarkEmitter &ORE,
-            AssumptionCache &AC, const TargetTransformInfo &TTI)
+            AssumptionCache &AC, const TargetTransformInfo &TTI,
+            LoopAccessInfoManager &LAIs)
       : Opts(Opts), LDT(LI), DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy),
         LI(LI), DT(DT), DI(DI), AA(AA), SE(SE), PDT(PDT), ORE(ORE), AC(AC),
-        TTI(TTI) {}
+        TTI(TTI), LAIs(LAIs) {}
 
   /// This is the main entry point for loop fusion. It will traverse the
   /// specified function and collect candidate loops to fuse, starting at the
@@ -677,11 +684,58 @@ private:
     }
   }
 
-  /// Determine if it is beneficial to fuse two loops.
-  bool isBeneficialFusion(unsigned ReusedValueCount) const {
+  /// Determine if it is beneficial to fuse two loops. If it is not, update
+  /// statistics and emit a missed remark explaining why.
+  bool isBeneficialFusion(const FusionCandidate &FC0,
+                          const FusionCandidate &FC1,
+                          unsigned ReusedValueCount) {
     if (Opts.loop_fusion_disable_cost_model)
       return true;
-    return ReusedValueCount >= Opts.loop_fusion_min_reused_values;
+
+    if (ReusedValueCount < Opts.loop_fusion_min_reused_values) {
+      ++InsufficientReuse;
+      reportFusionInsufficientReuse(FC0, FC1, ReusedValueCount);
+      return false;
+    }
+
+    // Fusing a vectorizable loop with a non-vectorizable one places the
+    // vectorizable loop's statements in a loop LoopVectorize cannot widen.
+    if (isLikelyVectorizable(*FC0.L) != isLikelyVectorizable(*FC1.L)) {
+      ++MixedVectorizability;
+      reportLoopFusion<OptimizationRemarkMissed>(
+          FC0, FC1, "MixedVectorizability",
+          "Fusion would merge a vectorizable loop with a non-vectorizable "
+          "loop");
+      return false;
+    }
+
+    return true;
+  }
+
+  /// Return true if LAA finds no memory dependence preventing vectorization of
+  /// \p L and every load and store in \p L is loop-invariant, consecutive, or
+  /// has a constant stride LoopVectorize can form an interleave group from.
+  /// LAA only establishes legality; loops relying on larger or unknown strides
+  /// need gathers and scatters, are rarely widened, and are therefore treated
+  /// as non-vectorizable.
+  bool isLikelyVectorizable(Loop &L) {
+    if (!L.isInnermost())
+      return false;
+
+    const LoopAccessInfo *LAI = &LAIs.getInfo(L);
+    if (!LAI->canVectorizeMemory())
+      return false;
+
+    const MemoryDepChecker &DepChecker = LAI->getDepChecker();
+    return all_of(DepChecker.getMemoryInstructions(), [&](Instruction *I) {
+      Value *Ptr = getLoadStorePointerOperand(I);
+      if (SE.isLoopInvariant(SE.getSCEV(Ptr), &L))
+        return true;
+      std::optional<int64_t> Stride =
+          getPtrStride(DepChecker.getPSE(), getLoadStoreType(I), Ptr, &L, DT);
+      return Stride && (std::abs(*Stride) == 1 ||
+                        InterleavedAccessInfo::isStrided(*Stride));
+    });
   }
 
   /// Computes the integer difference in trip counts:
@@ -958,15 +1012,12 @@ private:
           }
         }
 
-        unsigned ReusedValueCount = ReusedValues.size();
-        bool BeneficialToFuse = isBeneficialFusion(ReusedValueCount);
+        bool BeneficialToFuse =
+            isBeneficialFusion(FC0, FC1, ReusedValues.size());
         LLVM_DEBUG(dbgs() << "\tFusion appears to be "
                           << (BeneficialToFuse ? "" : "un") << "profitable!\n");
-        if (!BeneficialToFuse) {
-          ++InsufficientReuse;
-          reportFusionInsufficientReuse(FC0, FC1, ReusedValueCount);
+        if (!BeneficialToFuse)
           continue;
-        }
 
         // All analysis has completed and has determined that fusion is legal
         // and profitable. At this point, start transforming the code and
@@ -993,8 +1044,13 @@ private:
         reportLoopFusion<OptimizationRemark>((Peel ? FC0Copy : FC0), FC1,
                                              "FuseCounter", "Loops fused");
 
+        // Fusion keeps the first candidate's Loop object and deletes the
+        // second, so neither can keep its cached LoopAccessInfo.
+        LAIs.erase(*FC0.L);
+        LAIs.erase(*FC1.L);
         FusionCandidate FusedCand(performFusion((Peel ? FC0Copy : FC0), FC1),
                                   DT, &PDT, ORE, FC0Copy.PP);
+        LAIs.clear();
         FusedCand.verify();
         assert(FusedCand.isEligibleForFusion(SE) &&
                "Fused candidate should be eligible for fusion!");
@@ -2053,7 +2109,9 @@ PreservedAnalyses LoopFusePass::run(Function &F, FunctionAnalysisManager &AM) {
   if (Changed)
     PDT.recalculate(F);
 
-  LoopFuser LF(ScalarOptions::Global, LI, DT, DI, AA, SE, PDT, ORE, AC, TTI);
+  auto &LAIs = AM.getResult<LoopAccessAnalysis>(F);
+  LoopFuser LF(ScalarOptions::Global, LI, DT, DI, AA, SE, PDT, ORE, AC, TTI,
+               LAIs);
   Changed |= LF.fuseLoops(F);
   if (!Changed)
     return PreservedAnalyses::all();
