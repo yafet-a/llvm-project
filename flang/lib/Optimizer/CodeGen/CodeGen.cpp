@@ -70,9 +70,14 @@
 #include "mlir/Target/LLVMIR/Import.h"
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 
 namespace fir {
@@ -3263,6 +3268,77 @@ struct InsertOnRangeOpConversion
 };
 } // namespace
 
+/// Marks an array coordinate whose subscripts the lowering may state to stay
+/// within the extents of the array.
+static constexpr llvm::StringLiteral inRangeSubscriptsAttrName =
+    "fir.in_range_subscripts";
+
+/// Is \p addr only used as the address of a load or store of the element, maybe
+/// through conversions that keep the element type? Any other use could reach
+/// memory outside the element, for instance by passing it on as the start of
+/// an array.
+static bool onlyAccessesElement(mlir::Value addr) {
+  mlir::Type eleTy =
+      fir::unwrapSequenceType(fir::unwrapRefType(addr.getType()));
+  for (mlir::OpOperand &use : addr.getUses()) {
+    mlir::Operation *user = use.getOwner();
+    if (mlir::isa<fir::LoadOp>(user))
+      continue;
+    if (auto store = mlir::dyn_cast<fir::StoreOp>(user)) {
+      if (use.get() == store.getMemref() && store.getValue() != addr)
+        continue;
+      return false;
+    }
+    auto convert = mlir::dyn_cast<fir::ConvertOp>(user);
+    if (!convert ||
+        fir::unwrapSequenceType(fir::unwrapRefType(convert.getType())) !=
+            eleTy ||
+        !onlyAccessesElement(convert))
+      return false;
+  }
+  return true;
+}
+
+/// Does the language guarantee that the subscripts of \p coor stay within the
+/// extents of the array it indexes, and can those extents be stated?
+///
+/// Fortran 2018 section 9.5.3.3.2 requires this of a conforming program. An
+/// assumed-size dimension has no extent for a subscript to stay within. A boxed
+/// base carries its extents in the descriptor; any other base must state them.
+static bool hasInRangeSubscripts(fir::cg::XArrayCoorOp coor) {
+  if (!coor.getSubcomponent().empty() || !coor.getLenParams().empty())
+    return false;
+  if (!mlir::isa<fir::BaseBoxType>(coor.getMemref().getType())) {
+    if (coor.getShape().empty() ||
+        llvm::isa_and_nonnull<fir::AssumedSizeExtentOp>(
+            coor.getShape().back().getDefiningOp()))
+      return false;
+  }
+  return onlyAccessesElement(coor);
+}
+
+/// Wrap \p base in 'llvm.assume.chained', stating the \p extents of the array
+/// it points to, from the fastest-varying dimension to the slowest, and, when
+/// they are not implied by the extents, the byte \p strides of its dimensions.
+static mlir::Value
+assumeArrayExtents(mlir::Location loc, mlir::Value base,
+                   mlir::ValueRange extents, mlir::ValueRange strides,
+                   mlir::ConversionPatternRewriter &rewriter) {
+  llvm::SmallVector<mlir::ValueRange, 2> bundles{extents};
+  llvm::SmallVector<mlir::Attribute, 2> tags{
+      rewriter.getStringAttr("array.extents")};
+  if (!strides.empty()) {
+    bundles.push_back(strides);
+    tags.push_back(rewriter.getStringAttr("array.strides"));
+  }
+  auto call = mlir::LLVM::CallIntrinsicOp::create(
+      rewriter, loc, mlir::TypeRange{base.getType()},
+      rewriter.getStringAttr("llvm.assume.chained"), mlir::ValueRange{base},
+      mlir::LLVM::FastmathFlagsAttr{}, bundles, rewriter.getArrayAttr(tags),
+      /*arg_attrs=*/nullptr, /*res_attrs=*/nullptr);
+  return call->getResult(0);
+}
+
 namespace {
 /// XArrayCoor is the address arithmetic on a dynamically shaped, sliced,
 /// shifted etc. array.
@@ -3310,6 +3386,9 @@ struct XArrayCoorOpConversion
     mlir::LLVM::IntegerOverflowFlags addMulFlags = nsw | nuw;
     mlir::LLVM::GEPNoWrapFlags gepFlags =
         mlir::LLVM::GEPNoWrapFlags::nusw | mlir::LLVM::GEPNoWrapFlags::nuw;
+    const bool assumeExtents = coor->hasAttr(inRangeSubscriptsAttrName);
+    llvm::SmallVector<mlir::Value> extents;
+    llvm::SmallVector<mlir::Value> strides;
 
     // For each dimension of the array, generate the offset calculation.
     for (unsigned i = 0; i < rank; ++i, ++indexOffset, ++shapeOffset,
@@ -3363,6 +3442,12 @@ struct XArrayCoorOpConversion
             mlir::LLVM::MulOp::create(rewriter, loc, idxTy, diff, stride, nsw);
         offset =
             mlir::LLVM::AddOp::create(rewriter, loc, idxTy, sc, offset, nsw);
+        if (assumeExtents) {
+          extents.push_back(getDimFieldFromBox(loc, baseBoxTyPair, operands[0],
+                                               i, kDimExtentPos, idxTy,
+                                               rewriter));
+          strides.push_back(stride);
+        }
       } else {
         // Use stride computed at last iteration.
         auto sc = mlir::LLVM::MulOp::create(rewriter, loc, idxTy, diff, prevExt,
@@ -3374,6 +3459,8 @@ struct XArrayCoorOpConversion
         auto nextExt = integerCast(loc, rewriter, idxTy, operands[shapeOffset]);
         prevExt = mlir::LLVM::MulOp::create(rewriter, loc, idxTy, prevExt,
                                             nextExt, addMulFlags);
+        if (assumeExtents)
+          extents.push_back(nextExt);
       }
     }
 
@@ -3384,6 +3471,8 @@ struct XArrayCoorOpConversion
       mlir::Type byteTy = ::getI8Type(coor.getContext());
       mlir::Value base =
           getBaseAddrFromBox(loc, baseBoxTyPair, operands[0], rewriter);
+      if (assumeExtents)
+        base = assumeArrayExtents(loc, base, extents, strides, rewriter);
       llvm::SmallVector<mlir::LLVM::GEPArg> args{offset};
       auto addr =
           mlir::LLVM::GEPOp::create(rewriter, loc, llvmPtrTy, byteTy, base,
@@ -3450,8 +3539,11 @@ struct XArrayCoorOpConversion
                          coor.getSubcomponent().size()));
       args.append(indices.begin(), indices.end());
     }
+    mlir::Value base = adaptor.getMemref();
+    if (assumeExtents)
+      base = assumeArrayExtents(loc, base, extents, {}, rewriter);
     rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
-        coor, llvmPtrTy, gepObjectType, adaptor.getMemref(), args, gepFlags);
+        coor, llvmPtrTy, gepObjectType, base, args, gepFlags);
     return mlir::success();
   }
 };
@@ -5271,6 +5363,15 @@ public:
       return;
     }
 
+    // The uses of an array coordinate are only reliable before the conversion
+    // starts rewriting them.
+    if (options.emitArrayExtentsAssumption)
+      mod.walk([](fir::cg::XArrayCoorOp coor) {
+        if (hasInRangeSubscripts(coor))
+          coor->setAttr(inRangeSubscriptsAttrName,
+                        mlir::UnitAttr::get(coor.getContext()));
+      });
+
     auto *context = getModule().getContext();
     fir::LLVMTypeConverter typeConverter{getModule(),
                                          options.applyTBAA || applyTBAA,
@@ -5359,6 +5460,83 @@ private:
   fir::FIRToLLVMPassOptions options;
 };
 
+using ChainedCallGroup = llvm::SmallVector<llvm::CallInst *, 4>;
+using ChainedCallGroups = llvm::SmallVector<ChainedCallGroup, 2>;
+
+/// Merge equivalent chains at their nearest common dominator.
+static void deduplicateAssumeChainedCallsImpl(llvm::Module &module) {
+  if (llvm::none_of(module, [](const llvm::Function &function) {
+        return function.getIntrinsicID() == llvm::Intrinsic::assume_chained;
+      }))
+    return;
+
+  for (llvm::Function &function : module) {
+    llvm::DenseMap<llvm::Value *, ChainedCallGroups> callsByBase;
+    for (llvm::BasicBlock &block : function) {
+      for (llvm::Instruction &instruction : block) {
+        auto *call = llvm::dyn_cast<llvm::IntrinsicInst>(&instruction);
+        if (!call || call->getIntrinsicID() != llvm::Intrinsic::assume_chained)
+          continue;
+
+        ChainedCallGroups &groups = callsByBase[call->getArgOperand(0)];
+        ChainedCallGroup *matchingGroup = nullptr;
+        for (ChainedCallGroup &group : groups) {
+          if (call->isIdenticalTo(group.front())) {
+            matchingGroup = &group;
+            break;
+          }
+        }
+        if (matchingGroup)
+          matchingGroup->push_back(call);
+        else
+          groups.push_back({call});
+      }
+    }
+
+    if (callsByBase.empty())
+      continue;
+
+    llvm::DominatorTree domTree(function);
+    for (auto &entry : callsByBase) {
+      for (ChainedCallGroup &group : entry.second) {
+        if (group.size() == 1)
+          continue;
+
+        llvm::BasicBlock *domBlock = group.front()->getParent();
+        for (llvm::CallInst *call : llvm::ArrayRef(group).drop_front()) {
+          domBlock =
+              domTree.findNearestCommonDominator(domBlock, call->getParent());
+          if (!domBlock)
+            break;
+        }
+        if (!domBlock)
+          continue;
+
+        llvm::Instruction *insertBefore = domBlock->getTerminator();
+        for (llvm::CallInst *call : group) {
+          if (call->getParent() == domBlock && call->comesBefore(insertBefore))
+            insertBefore = call;
+        }
+
+        llvm::CallInst *representative = group.front();
+        bool operandsDominate = llvm::all_of(
+            representative->operands(), [&](const llvm::Use &operand) {
+              return domTree.dominates(operand.get(), insertBefore);
+            });
+        if (!operandsDominate)
+          continue;
+
+        if (representative != insertBefore)
+          representative->moveBefore(insertBefore->getIterator());
+        for (llvm::CallInst *call : llvm::ArrayRef(group).drop_front()) {
+          call->replaceAllUsesWith(representative);
+          call->eraseFromParent();
+        }
+      }
+    }
+  }
+}
+
 /// Lower from LLVM IR dialect to proper LLVM-IR and dump the module
 struct LLVMIRLoweringPass
     : public mlir::PassWrapper<LLVMIRLoweringPass,
@@ -5376,6 +5554,7 @@ struct LLVMIRLoweringPass
     llvm::LLVMContext llvmCtx;
     if (auto llvmModule = mlir::translateModuleToLLVMIR(
             getModule(), llvmCtx, optName ? *optName : "FIRModule")) {
+      deduplicateAssumeChainedCallsImpl(*llvmModule);
       printer(*llvmModule, output);
       return;
     }
@@ -5390,6 +5569,10 @@ private:
 };
 
 } // namespace
+
+void fir::deduplicateAssumeChainedCalls(llvm::Module &module) {
+  deduplicateAssumeChainedCallsImpl(module);
+}
 
 std::unique_ptr<mlir::Pass> fir::createFIRToLLVMPass() {
   return std::make_unique<FIRToLLVMLowering>();

@@ -17,6 +17,7 @@
 #include "flang/Frontend/ParserActions.h"
 #include "flang/Lower/Bridge.h"
 #include "flang/Lower/Support/Verifier.h"
+#include "flang/Optimizer/CodeGen/CodeGen.h"
 #include "flang/Optimizer/Dialect/FIRAttr.h"
 #include "flang/Optimizer/Dialect/Support/FIRContext.h"
 #include "flang/Optimizer/Dialect/Support/KindMapping.h"
@@ -832,6 +833,8 @@ void CodeGenAction::generateLLVMIR() {
     ci.getDiagnostics().Report(diagID);
     return;
   }
+
+  fir::deduplicateAssumeChainedCalls(*llvmModule);
 
   // Set PIC/PIE level LLVM module flags.
   if (opts.PICLevel > 0) {

@@ -45,6 +45,11 @@ extern llvm::cl::opt<bool> ignoreMissingTypeDescriptors;
 /// differs from most compilers).
 extern llvm::cl::opt<bool> skipExternalRttiDefinition;
 
+/// Shared option in tools to control stating the extents of an array, through
+/// 'llvm.assume.chained', at the accesses whose subscripts must stay within
+/// them. Even when enabled, this is only done at higher optimization levels.
+extern llvm::cl::opt<bool> enableArrayExtentsAssumption;
+
 /// Default optimization level used to create Flang pass pipeline is O0.
 extern llvm::OptimizationLevel defaultOptLevel;
 
