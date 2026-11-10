@@ -2642,6 +2642,7 @@ bool CodeGenPrepare::optimizeCallInst(CallInst *CI, ModifyDT &ModifiedDT) {
       return true;
     }
 
+    case Intrinsic::assume_chained:
     case Intrinsic::launder_invariant_group: {
       Value *ArgVal = II->getArgOperand(0);
       auto it = LargeOffsetGEPMap.find(II);

@@ -27185,6 +27185,47 @@ sufficient overall improvement in code quality. For this reason,
 that the optimizer can otherwise deduce or facts that are of little use to the
 optimizer.
 
+(int_assume_chained)=
+
+#### '`llvm.assume.chained`' Intrinsic
+
+##### Syntax:
+
+This is an overloaded intrinsic.
+
+```
+declare ptr @llvm.assume.chained.p0(ptr %base)
+```
+
+##### Overview:
+
+The `llvm.assume.chained` intrinsic returns its operand unchanged and uses
+operand bundles to state facts about the memory accesses made through pointers
+derived from its result. Unlike `llvm.assume`, the facts travel with the
+pointer along the def-use chain instead of holding at a program point.
+
+##### Arguments:
+
+The argument is the pointer the facts are about. The following operand
+bundles are recognized:
+
+- `"array.extents"(i64 %e0, ..., i64 %eN)`: the pointer is the base of an
+  array whose dimensions have the given extents, listed from the
+  fastest-varying dimension to the slowest.
+- `"array.strides"(i64 %s0, ..., i64 %sN)`: the byte stride of each dimension,
+  in the same order. When absent, dimension `k` has the stride of the element
+  times the product of the extents of dimensions `0` to `k-1`.
+
+##### Semantics:
+
+The result is the operand. With an `"array.extents"` bundle, every load or
+store through a pointer derived from the result accesses an element whose
+zero-based subscript in each dimension is non-negative and less than that
+dimension's extent. If this does not hold, the behavior is undefined.
+
+The call has no side effects. Replacing its uses with its operand is always
+correct and only loses the stated facts.
+
 (int_ssa_copy)=
 
 #### '`llvm.ssa.copy`' Intrinsic

@@ -3543,6 +3543,17 @@ llvm.func @call_intrin_with_opbundle(%arg0 : !llvm.ptr) {
 // CHECK-NEXT:   ret void
 // CHECK-NEXT: }
 
+// The overload is resolved from the call arguments, not the bundle operands.
+llvm.func @call_overloaded_intrin_with_opbundle(%arg0 : !llvm.ptr, %arg1 : i64) -> !llvm.ptr {
+  %0 = llvm.call_intrinsic "llvm.assume.chained"(%arg0) ["array.extents"(%arg1 : i64)] : (!llvm.ptr) -> !llvm.ptr
+  llvm.return %0 : !llvm.ptr
+}
+
+//      CHECK: define ptr @call_overloaded_intrin_with_opbundle(ptr %0, i64 %1) {
+// CHECK-NEXT:   %3 = call ptr @llvm.assume.chained.p0(ptr %0) [ "array.extents"(i64 %1) ]
+// CHECK-NEXT:   ret ptr %3
+// CHECK-NEXT: }
+
 // -----
 
 module {

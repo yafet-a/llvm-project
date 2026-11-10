@@ -26,3 +26,18 @@ define ptr @ptr_annotation(ptr %x) {
   ret ptr %1
 }
 
+define ptr @assume_chained(ptr %x, i64 %n) {
+; CHECK-LABEL: 'assume_chained'
+; CHECK-NEXT:  Classifying expressions for: @assume_chained
+; CHECK-NEXT:    %1 = call ptr @llvm.assume.chained.p0(ptr %x) [ "array.extents"(i64 %n, i64 20) ]
+; CHECK-NEXT:    --> %x U: full-set S: full-set
+; CHECK-NEXT:    %2 = getelementptr i8, ptr %1, i64 8
+; CHECK-NEXT:    --> (8 + %x) U: full-set S: full-set
+; CHECK-NEXT:  Determining loop execution counts for: @assume_chained
+;
+  %1 = call ptr @llvm.assume.chained.p0(ptr %x)
+      [ "array.extents"(i64 %n, i64 20) ]
+  %2 = getelementptr i8, ptr %1, i64 8
+  ret ptr %2
+}
+

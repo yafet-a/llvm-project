@@ -1367,7 +1367,12 @@ public:
                              TTI::TargetCostKind CostKind,
                              Type *AccessType) const override {
     assert(PointeeType && Ptr && "can't get GEPCost of nullptr");
-    auto *BaseGV = dyn_cast<GlobalValue>(Ptr->stripPointerCasts());
+    const Value *Base = Ptr->stripPointerCasts();
+    // llvm.assume.chained returns its operand and is erased before codegen.
+    if (auto *II = dyn_cast<IntrinsicInst>(Base);
+        II && II->getIntrinsicID() == Intrinsic::assume_chained)
+      Base = II->getArgOperand(0)->stripPointerCasts();
+    auto *BaseGV = dyn_cast<GlobalValue>(Base);
     bool HasBaseReg = (BaseGV == nullptr);
 
     auto PtrSizeBits = DL.getPointerTypeSizeInBits(Ptr->getType());

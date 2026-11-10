@@ -177,6 +177,7 @@
 ; CHECK-POSTLINK-O-NEXT: Running pass: LoopRotatePass
 ; CHECK-POSTLINK-O-NEXT: Running pass: LoopDeletionPass
 ; CHECK-POSTLINK-O-NEXT: Running pass: LoopInterchangePass
+; CHECK-POSTLINK-O-NEXT: Running pass: DropAssumeChainedPass
 ; CHECK-POSTLINK-O-NEXT: Running pass: LoopDistributePass
 ; CHECK-POSTLINK-O-NEXT: Running analysis: LoopAccessAnalysis on foo
 ; CHECK-POSTLINK-O-NEXT: Running pass: InjectTLIMappings

@@ -1412,6 +1412,7 @@ bool FastISel::selectIntrinsicCall(const IntrinsicInst *II) {
     return true;
   }
 
+  case Intrinsic::assume_chained:
   case Intrinsic::launder_invariant_group:
   case Intrinsic::expect:
   case Intrinsic::expect_with_probability: {

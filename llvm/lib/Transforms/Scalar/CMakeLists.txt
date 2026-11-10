@@ -16,6 +16,7 @@ add_llvm_component_library(LLVMScalarOpts
   DeadStoreElimination.cpp
   DFAJumpThreading.cpp
   DivRemPairs.cpp
+  DropAssumeChained.cpp
   DropUnnecessaryAssumes.cpp
   EarlyCSE.cpp
   ExpandMemCmp.cpp

@@ -1077,6 +1077,14 @@ def int_assume : DefaultAttrsIntrinsic<[], [llvm_i1_ty],
                    [IntrWriteMem, IntrInaccessibleMemOnly,
                     NoUndef<ArgIndex<0>>]>;
 
+// 'llvm.assume.chained': returns its pointer operand unchanged. The operand
+// bundles of the call state facts about the accesses made through pointers
+// derived from its result. The operand is not marked 'returned', which would
+// let the call be folded away together with those facts.
+def int_assume_chained : DefaultAttrsIntrinsic<[llvm_anyptr_ty],
+                           [LLVMMatchType<0>],
+                           [IntrNoMem, IntrSpeculatable]>;
+
 // 'llvm.experimental.noalias.scope.decl' intrinsic: Inserted at the location of
 // noalias scope declaration. Makes it possible to identify that a noalias scope
 // is only valid inside the body of a loop.

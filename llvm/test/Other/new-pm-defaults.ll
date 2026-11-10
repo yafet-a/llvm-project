@@ -241,6 +241,7 @@
 ; CHECK-O-NEXT: Running pass: LoopRotatePass
 ; CHECK-O-NEXT: Running pass: LoopDeletionPass
 ; CHECK-O-NEXT: Running pass: LoopInterchange
+; CHECK-O-NEXT: Running pass: DropAssumeChainedPass
 ; CHECK-O-NEXT: Running pass: LoopDistributePass
 ; CHECK-O-NEXT: Running analysis: LoopAccessAnalysis on foo
 ; CHECK-O-NEXT: Running pass: InjectTLIMappings

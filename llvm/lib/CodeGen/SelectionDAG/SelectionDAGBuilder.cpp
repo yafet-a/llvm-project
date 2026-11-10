@@ -7928,6 +7928,7 @@ void SelectionDAGBuilder::visitIntrinsicCall(const CallInst &I,
 
   case Intrinsic::annotation:
   case Intrinsic::ptr_annotation:
+  case Intrinsic::assume_chained:
   case Intrinsic::launder_invariant_group:
     // Drop the intrinsic, but forward the value
     setValue(&I, getValue(I.getOperand(0)));

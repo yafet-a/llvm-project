@@ -97,6 +97,7 @@
 #include "llvm/Transforms/Scalar/DFAJumpThreading.h"
 #include "llvm/Transforms/Scalar/DeadStoreElimination.h"
 #include "llvm/Transforms/Scalar/DivRemPairs.h"
+#include "llvm/Transforms/Scalar/DropAssumeChained.h"
 #include "llvm/Transforms/Scalar/DropUnnecessaryAssumes.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/ExpandMemCmp.h"
@@ -1527,6 +1528,11 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
 
   OptimizePM.addPass(
       createFunctionToLoopPassAdaptor(std::move(LPM), /*UseMemorySSA=*/false));
+
+  // Interchange is the last consumer of llvm.assume.chained facts; drop the
+  // calls so later loop passes and codegen see plain addresses.
+  if (PTO.LoopInterchange)
+    OptimizePM.addPass(DropAssumeChainedPass());
 
   // FIXME: This may not be the right place in the pipeline.
   // We need to have the data to support the right place.

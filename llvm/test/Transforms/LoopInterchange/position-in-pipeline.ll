@@ -13,6 +13,7 @@
 ; CHECK-NEXT: Running pass: LoopRotatePass
 ; CHECK-NEXT: Running pass: LoopDeletionPass
 ; CHECK-NEXT: Running pass: LoopInterchangePass
+; CHECK-NEXT: Running pass: DropAssumeChainedPass
 ; CHECK-NEXT: Running pass: LoopDistributePass
 ; CHECK-NEXT: Running pass: InjectTLIMappings
 ; CHECK-NEXT: Running pass: LoopVectorizePass

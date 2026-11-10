@@ -676,7 +676,7 @@ private:
   /// Given a linear access function, tries to recover subscripts
   /// for each dimension of the array element access.
   bool tryDelinearize(Instruction *Src, Instruction *Dst,
-                      SmallVectorImpl<Subscript> &Pair);
+                      SmallVectorImpl<Subscript> &Pair, bool &UsedArrayExtents);
 
   /// Tries to delinearize \p Src and \p Dst access functions for a fixed size
   /// multi-dimensional array. Calls delinearizeFixedSizeArray() to delinearize
@@ -684,16 +684,16 @@ private:
   bool tryDelinearizeFixedSize(Instruction *Src, Instruction *Dst,
                                const SCEV *SrcAccessFn, const SCEV *DstAccessFn,
                                SmallVectorImpl<const SCEV *> &SrcSubscripts,
-                               SmallVectorImpl<const SCEV *> &DstSubscripts);
+                               SmallVectorImpl<const SCEV *> &DstSubscripts,
+                               bool &UsedArrayExtents);
 
   /// Tries to delinearize access function for a multi-dimensional array with
   /// symbolic runtime sizes.
   /// Returns true upon success and false otherwise.
-  bool
-  tryDelinearizeParametricSize(Instruction *Src, Instruction *Dst,
-                               const SCEV *SrcAccessFn, const SCEV *DstAccessFn,
-                               SmallVectorImpl<const SCEV *> &SrcSubscripts,
-                               SmallVectorImpl<const SCEV *> &DstSubscripts);
+  bool tryDelinearizeParametricSize(
+      Instruction *Src, Instruction *Dst, const SCEV *SrcAccessFn,
+      const SCEV *DstAccessFn, SmallVectorImpl<const SCEV *> &SrcSubscripts,
+      SmallVectorImpl<const SCEV *> &DstSubscripts, bool &UsedArrayExtents);
 
   /// checkSubscript - Helper function for checkSrcSubscript and
   /// checkDstSubscript to avoid duplicate code

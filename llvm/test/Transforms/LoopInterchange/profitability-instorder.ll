@@ -262,3 +262,85 @@ loop.i.latch:
 exit:
   ret void
 }
+
+; for (i = 0; i < n; i++)
+;   for (j = 0; j < m; j++)
+;     A[i + n*j] = 0;
+;
+; The strides 8 and 8*n cannot be strictly ordered, since the runtime extent n
+; may be 1, but 8*n is a parametric multiple of 8, so the j loop should be
+; the outer one. The in-range marker lets DA prove the store independent.
+;
+define void @runtime_extent(ptr %A, i64 %n, i64 %m) {
+; CHECK-LABEL: define void @runtime_extent(
+; CHECK-SAME: ptr [[A:%.*]], i64 [[N:%.*]], i64 [[M:%.*]]) {
+; CHECK-NEXT:  [[ENTRY:.*:]]
+; CHECK-NEXT:    [[A_C:%.*]] = call ptr @llvm.assume.chained.p0(ptr [[A]]) [ "array.extents"(i64 [[N]], i64 [[M]]) ]
+; CHECK-NEXT:    [[N_POS:%.*]] = icmp sgt i64 [[N]], 0
+; CHECK-NEXT:    [[M_POS:%.*]] = icmp sgt i64 [[M]], 0
+; CHECK-NEXT:    [[GUARD:%.*]] = and i1 [[N_POS]], [[M_POS]]
+; CHECK-NEXT:    br i1 [[GUARD]], label %[[LOOP_J_PREHEADER:.*]], label %[[EXIT:.*]]
+; CHECK:       [[LOOP_I_HEADER_PREHEADER:.*]]:
+; CHECK-NEXT:    br label %[[LOOP_I_HEADER:.*]]
+; CHECK:       [[LOOP_I_HEADER]]:
+; CHECK-NEXT:    [[I:%.*]] = phi i64 [ [[I_NEXT:%.*]], %[[LOOP_I_LATCH:.*]] ], [ 0, %[[LOOP_I_HEADER_PREHEADER]] ]
+; CHECK-NEXT:    br label %[[LOOP_J_SPLIT1:.*]]
+; CHECK:       [[LOOP_J_PREHEADER]]:
+; CHECK-NEXT:    br label %[[LOOP_J:.*]]
+; CHECK:       [[LOOP_J]]:
+; CHECK-NEXT:    [[J:%.*]] = phi i64 [ [[TMP0:%.*]], %[[LOOP_J_SPLIT:.*]] ], [ 0, %[[LOOP_J_PREHEADER]] ]
+; CHECK-NEXT:    br label %[[LOOP_I_HEADER_PREHEADER]]
+; CHECK:       [[LOOP_J_SPLIT1]]:
+; CHECK-NEXT:    [[COL:%.*]] = mul nuw nsw i64 [[J]], [[N]]
+; CHECK-NEXT:    [[IDX:%.*]] = add nuw nsw i64 [[I]], [[COL]]
+; CHECK-NEXT:    [[GEP:%.*]] = getelementptr nusw nuw [8 x i8], ptr [[A_C]], i64 [[IDX]]
+; CHECK-NEXT:    store double 0.000000e+00, ptr [[GEP]], align 8
+; CHECK-NEXT:    [[J_NEXT:%.*]] = add nuw nsw i64 [[J]], 1
+; CHECK-NEXT:    [[J_DONE:%.*]] = icmp eq i64 [[J_NEXT]], [[M]]
+; CHECK-NEXT:    br label %[[LOOP_I_LATCH]]
+; CHECK:       [[LOOP_J_SPLIT]]:
+; CHECK-NEXT:    [[TMP0]] = add nuw nsw i64 [[J]], 1
+; CHECK-NEXT:    [[TMP1:%.*]] = icmp eq i64 [[TMP0]], [[M]]
+; CHECK-NEXT:    br i1 [[TMP1]], label %[[EXIT_LOOPEXIT:.*]], label %[[LOOP_J]]
+; CHECK:       [[LOOP_I_LATCH]]:
+; CHECK-NEXT:    [[I_NEXT]] = add nuw nsw i64 [[I]], 1
+; CHECK-NEXT:    [[I_DONE:%.*]] = icmp eq i64 [[I_NEXT]], [[N]]
+; CHECK-NEXT:    br i1 [[I_DONE]], label %[[LOOP_J_SPLIT]], label %[[LOOP_I_HEADER]]
+; CHECK:       [[EXIT_LOOPEXIT]]:
+; CHECK-NEXT:    br label %[[EXIT]]
+; CHECK:       [[EXIT]]:
+; CHECK-NEXT:    ret void
+;
+entry:
+  %A.c = call ptr @llvm.assume.chained.p0(ptr %A)
+  [ "array.extents"(i64 %n, i64 %m) ]
+  %n.pos = icmp sgt i64 %n, 0
+  %m.pos = icmp sgt i64 %m, 0
+  %guard = and i1 %n.pos, %m.pos
+  br i1 %guard, label %loop.i.header, label %exit
+
+loop.i.header:
+  %i = phi i64 [ 0, %entry ], [ %i.next, %loop.i.latch ]
+  br label %loop.j
+
+loop.j:
+  %j = phi i64 [ 0, %loop.i.header ], [ %j.next, %loop.j ]
+  %col = mul nuw nsw i64 %j, %n
+  %idx = add nuw nsw i64 %i, %col
+  %gep = getelementptr nusw nuw [8 x i8], ptr %A.c, i64 %idx
+  store double 0.000000e+00, ptr %gep, align 8
+  %j.next = add nuw nsw i64 %j, 1
+  %j.done = icmp eq i64 %j.next, %m
+  br i1 %j.done, label %loop.i.latch, label %loop.j
+
+loop.i.latch:
+  %i.next = add nuw nsw i64 %i, 1
+  %i.done = icmp eq i64 %i.next, %n
+  br i1 %i.done, label %exit, label %loop.i.header
+
+exit:
+  ret void
+}
+
+
+declare ptr @llvm.assume.chained.p0(ptr)

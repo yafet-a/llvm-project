@@ -13,15 +13,21 @@
 
 #include "llvm/Analysis/Delinearization.h"
 #include "AnalysisOptions.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionDivision.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
@@ -157,7 +163,81 @@ struct SCEVCollectAddRecMultiplies {
   bool isDone() const { return false; }
 };
 
+/// The shape stated by an 'llvm.assume.chained' call, with extents and strides
+/// ordered from the fastest- to the slowest-varying dimension.
+struct DeclaredShape {
+  Value *BaseValue = nullptr;
+  SmallVector<const SCEV *, 4> Extents;
+  SmallVector<const SCEV *, 4> Strides;
+};
+
 } // end anonymous namespace
+
+/// Return whether \p SrcContract and \p DstContract prove that \p Src and
+/// \p Dst address disjoint constant-offset subobjects of one allocation.
+static bool areDisjointSubobjects(ScalarEvolution &SE, Instruction *Src,
+                                  Instruction *Dst,
+                                  const DeclaredShape &SrcContract,
+                                  const DeclaredShape &DstContract) {
+  if (!SrcContract.BaseValue || !DstContract.BaseValue ||
+      SrcContract.BaseValue == DstContract.BaseValue ||
+      !SrcContract.Strides.empty() || !DstContract.Strides.empty())
+    return false;
+
+  const SCEV *SrcElementSize = SE.getElementSize(Src);
+  const SCEV *DstElementSize = SE.getElementSize(Dst);
+  if (SrcElementSize != DstElementSize)
+    return false;
+
+  auto GetByteSize = [](const DeclaredShape &Contract,
+                        const SCEV *ElementSize) -> std::optional<APInt> {
+    const auto *ElementSizeC = dyn_cast<SCEVConstant>(ElementSize);
+    if (!ElementSizeC || ElementSizeC->getAPInt().isZero() ||
+        ElementSizeC->getAPInt().isNegative())
+      return std::nullopt;
+    APInt Size = ElementSizeC->getAPInt();
+    for (const SCEV *Extent : Contract.Extents) {
+      const auto *ExtentC = dyn_cast<SCEVConstant>(Extent);
+      if (!ExtentC || ExtentC->getAPInt().isZero() ||
+          ExtentC->getAPInt().isNegative())
+        return std::nullopt;
+      bool Overflow;
+      Size = Size.umul_ov(ExtentC->getAPInt(), Overflow);
+      if (Overflow || Size.isNegative())
+        return std::nullopt;
+    }
+    return Size;
+  };
+
+  std::optional<APInt> SrcSize = GetByteSize(SrcContract, SrcElementSize);
+  std::optional<APInt> DstSize = GetByteSize(DstContract, DstElementSize);
+  if (!SrcSize || !DstSize)
+    return false;
+
+  const DataLayout &DL = Src->getModule()->getDataLayout();
+  unsigned OffsetBitWidth =
+      DL.getIndexTypeSizeInBits(SrcContract.BaseValue->getType());
+  APInt SrcOffset(OffsetBitWidth, 0);
+  APInt DstOffset(OffsetBitWidth, 0);
+  const Value *SrcRoot =
+      SrcContract.BaseValue->stripAndAccumulateConstantOffsets(
+          DL, SrcOffset, /*AllowNonInbounds=*/false);
+  const Value *DstRoot =
+      DstContract.BaseValue->stripAndAccumulateConstantOffsets(
+          DL, DstOffset, /*AllowNonInbounds=*/false);
+  if (SrcRoot != DstRoot || SrcSize->getActiveBits() >= OffsetBitWidth ||
+      DstSize->getActiveBits() >= OffsetBitWidth)
+    return false;
+
+  bool SrcOverflow;
+  bool DstOverflow;
+  APInt SrcEnd =
+      SrcOffset.sadd_ov(SrcSize->zextOrTrunc(OffsetBitWidth), SrcOverflow);
+  APInt DstEnd =
+      DstOffset.sadd_ov(DstSize->zextOrTrunc(OffsetBitWidth), DstOverflow);
+  return !SrcOverflow && !DstOverflow &&
+         (SrcEnd.sle(DstOffset) || DstEnd.sle(SrcOffset));
+}
 
 /// Find parametric terms in this SCEVAddRecExpr. We first for parameters in
 /// two places:
@@ -387,9 +467,13 @@ void llvm::computeAccessFunctions(ScalarEvolution &SE, const SCEV *Expr,
     Subscripts.push_back(R);
   }
 
-  // Also push in last position the remainder of the last division: it will be
-  // the access function of the innermost dimension.
-  Subscripts.push_back(Res);
+  if (!Res->isZero()) {
+    // This is only needed when the outermost array size is not known.  Res = 0
+    // when the outermost array dimension is known, as for example when reading
+    // array sizes from a local or global declaration.
+    Subscripts.push_back(Res);
+    LLVM_DEBUG(dbgs() << "Subscripts push_back Res: " << *Res << "\n");
+  }
 
   std::reverse(Subscripts.begin(), Subscripts.end());
 
@@ -488,15 +572,16 @@ static std::optional<APInt> tryIntoAPInt(const SCEV *S) {
 static bool collectConstantAbsSteps(ScalarEvolution &SE, const SCEV *Expr,
                                     SmallVectorImpl<uint64_t> &Steps,
                                     uint64_t ElementSize) {
-  // End of recursion. The constant value also must be a multiple of
-  // ElementSize.
-  if (const auto *Const = dyn_cast<SCEVConstant>(Expr)) {
-    const uint64_t Mod = Const->getAPInt().urem(ElementSize);
-    return Mod == 0;
-  }
+  // End of recursion. The value must be aligned to ElementSize. Permit a
+  // dynamic start only after recovering at least two dimensions; this avoids
+  // treating an arbitrary one-dimensional expression as an array shape.
+  if (const auto *Const = dyn_cast<SCEVConstant>(Expr))
+    return Const->getAPInt().urem(ElementSize) == 0;
 
   const SCEVAddRecExpr *AR = dyn_cast<SCEVAddRecExpr>(Expr);
-  if (!AR || !AR->isAffine())
+  if (!AR)
+    return Steps.size() >= 2 && SE.isKnownMultipleOf(Expr, ElementSize);
+  if (!AR->isAffine())
     return false;
 
   const SCEV *Step = AR->getStepRecurrence(SE);
@@ -580,6 +665,112 @@ bool llvm::findFixedSizeArrayDimensions(ScalarEvolution &SE, const SCEV *Expr,
   return true;
 }
 
+static ArrayRef<Use> getArrayExtents(const CallBase &Assumption) {
+  return Assumption.getOperandBundle("array.extents")->Inputs;
+}
+
+static DeclaredShape decodeDeclaredShape(ScalarEvolution &SE,
+                                         const CallBase &Assumption,
+                                         const SCEV *ElementSize) {
+  DeclaredShape Contract;
+  Contract.BaseValue = Assumption.getArgOperand(0);
+  for (const Use &Extent : getArrayExtents(Assumption))
+    Contract.Extents.push_back(SE.getTruncateOrZeroExtend(
+        SE.getSCEV(Extent.get()), ElementSize->getType()));
+  if (std::optional<OperandBundleUse> Strides =
+          Assumption.getOperandBundle("array.strides"))
+    for (const Use &Stride : Strides->Inputs)
+      Contract.Strides.push_back(SE.getTruncateOrZeroExtend(
+          SE.getSCEV(Stride.get()), ElementSize->getType()));
+  return Contract;
+}
+
+/// The 'llvm.assume.chained' call whose result the address of the load or
+/// store \p Access is derived from, if the call states the extents of the
+/// array being accessed.
+static const CallBase *getArrayExtentsAssumption(const Instruction *Access) {
+  const Value *Ptr = Access ? getLoadStorePointerOperand(Access) : nullptr;
+  if (!Ptr)
+    return nullptr;
+  Ptr = Ptr->stripPointerCasts();
+  while (const auto *GEP = dyn_cast<GEPOperator>(Ptr))
+    Ptr = GEP->getPointerOperand()->stripPointerCasts();
+  const auto *II = dyn_cast<IntrinsicInst>(Ptr);
+  if (!II || II->getIntrinsicID() != Intrinsic::assume_chained ||
+      !II->getOperandBundle("array.extents"))
+    return nullptr;
+  return II;
+}
+
+bool llvm::arrayExtentsProveDisjoint(ScalarEvolution &SE, Instruction *Src,
+                                     Instruction *Dst) {
+  const CallBase *SrcContract = getArrayExtentsAssumption(Src);
+  const CallBase *DstContract = getArrayExtentsAssumption(Dst);
+  if (!SrcContract || !DstContract || SrcContract == DstContract)
+    return false;
+
+  const SCEV *SrcElementSize = SE.getElementSize(Src);
+  const SCEV *DstElementSize = SE.getElementSize(Dst);
+  DeclaredShape DecodedSrc =
+      decodeDeclaredShape(SE, *SrcContract, SrcElementSize);
+  DeclaredShape DecodedDst =
+      decodeDeclaredShape(SE, *DstContract, DstElementSize);
+  return areDisjointSubobjects(SE, Src, Dst, DecodedSrc, DecodedDst);
+}
+
+/// Return whether the byte strides of \p Contract, if any, are those of a
+/// contiguous array with its extents. Only then does the mixed-radix shape
+/// formed by the extents describe the address arithmetic.
+static bool hasContiguousLayout(ScalarEvolution &SE,
+                                const DeclaredShape &Contract,
+                                const SCEV *ElementSize,
+                                const Instruction *CtxI) {
+  if (Contract.Strides.empty())
+    return true;
+  if (Contract.Strides.size() != Contract.Extents.size())
+    return false;
+  const SCEV *Expected = ElementSize;
+  for (auto [Extent, Stride] : zip(Contract.Extents, Contract.Strides)) {
+    if (Stride != Expected &&
+        !SE.isKnownPredicateAt(ICmpInst::ICMP_EQ, Stride, Expected, CtxI))
+      return false;
+    Expected = SE.getMulExpr(Expected, Extent);
+  }
+  return true;
+}
+
+/// Do the extents stated by \p Assumption describe the same array that
+/// delinearization arrived at in \p Sizes? Comparing them keeps a stale or
+/// mistaken claim from widening the analysis.
+static bool describesRecoveredShape(ScalarEvolution &SE,
+                                    const CallBase &Assumption,
+                                    ArrayRef<const SCEV *> Sizes,
+                                    DelinearizationShapeKind ShapeKind,
+                                    const Instruction *CtxI) {
+  if (Sizes.empty())
+    return false;
+  DeclaredShape Contract = decodeDeclaredShape(SE, Assumption, Sizes.back());
+  if (Contract.Extents.empty() ||
+      !hasContiguousLayout(SE, Contract, Sizes.back(), CtxI))
+    return false;
+
+  // Delinearization orders dimensions in the opposite direction and appends
+  // the element size. An incomplete shape omits the slowest-varying extent.
+  bool CompleteShape = ShapeKind == DelinearizationShapeKind::Complete;
+  size_t ExpectedSizes = Contract.Extents.size() + (CompleteShape ? 1 : 0);
+  if (Sizes.size() != ExpectedSizes)
+    return false;
+
+  size_t ComparedExtents = Contract.Extents.size() - (CompleteShape ? 0 : 1);
+  for (size_t I = 0; I != ComparedExtents; ++I) {
+    const SCEV *Declared = Contract.Extents[ComparedExtents - 1 - I];
+    if (Sizes[I] != Declared &&
+        !SE.isKnownPredicateAt(ICmpInst::ICMP_EQ, Sizes[I], Declared, CtxI))
+      return false;
+  }
+  return true;
+}
+
 /// Splits the SCEV into two vectors of SCEVs representing the subscripts and
 /// sizes of an array access, assuming that the array is a fixed size array.
 ///
@@ -634,31 +825,119 @@ bool llvm::findFixedSizeArrayDimensions(ScalarEvolution &SE, const SCEV *Expr,
 bool llvm::delinearizeFixedSizeArray(ScalarEvolution &SE, const SCEV *Expr,
                                      SmallVectorImpl<const SCEV *> &Subscripts,
                                      SmallVectorImpl<const SCEV *> &Sizes,
-                                     const SCEV *ElementSize) {
+                                     const SCEV *ElementSize,
+                                     DelinearizationShapeKind &ShapeKind,
+                                     const Instruction *CtxI) {
   // Clear output vectors.
   Subscripts.clear();
   Sizes.clear();
+  ShapeKind = DelinearizationShapeKind::UnknownOuterDimension;
 
-  // First step: find the fixed array size.
+  const SCEVUnknown *BasePointer =
+      dyn_cast<SCEVUnknown>(SE.getPointerBase(Expr));
+  const SCEV *Offset = BasePointer ? SE.getMinusSCEV(Expr, BasePointer) : Expr;
+
+  LLVM_DEBUG(dbgs() << "delinearizeFixedSizeArray, analysing expr: ";
+             Expr->dump(););
+
+  // The chain is part of this exact access, so its declared physical shape can
+  // delinearize source subscripts that are themselves linearized, such as
+  // A(N * I + J, N * K + L). Dependence analysis still has to prove that the
+  // recovered subscript expressions are injective.
+  if (const CallBase *Assumption = getArrayExtentsAssumption(CtxI)) {
+    DeclaredShape Contract = decodeDeclaredShape(SE, *Assumption, ElementSize);
+    const SCEV *ArrayOffset = Offset;
+    if (Expr->getType()->isPointerTy())
+      ArrayOffset = SE.getMinusSCEV(Expr, SE.getSCEV(Contract.BaseValue));
+    if (!isa<SCEVCouldNotCompute>(ArrayOffset) &&
+        hasContiguousLayout(SE, Contract, ElementSize, CtxI)) {
+      Sizes.append(Contract.Extents.rbegin(), Contract.Extents.rend());
+      Sizes.push_back(ElementSize);
+      computeAccessFunctions(SE, ArrayOffset, Subscripts, Sizes);
+      if (Subscripts.size() == Contract.Extents.size()) {
+        ShapeKind = DelinearizationShapeKind::Complete;
+        return true;
+      }
+      Subscripts.clear();
+      Sizes.clear();
+    }
+  }
+
+  // Otherwise infer the fixed array size from the access expression.
   SmallVector<uint64_t, 4> ConstSizes;
-  if (!findFixedSizeArrayDimensions(SE, Expr, ConstSizes, ElementSize)) {
+  if (!findFixedSizeArrayDimensions(SE, Offset, ConstSizes, ElementSize)) {
     Sizes.clear();
     return false;
   }
 
   // Convert the constant size to SCEV.
   for (uint64_t Size : ConstSizes)
-    Sizes.push_back(SE.getConstant(Expr->getType(), Size));
+    Sizes.push_back(SE.getConstant(Offset->getType(), Size));
 
   // Second step: compute the access functions for each subscript.
-  computeAccessFunctions(SE, Expr, Subscripts, Sizes);
+  computeAccessFunctions(SE, Offset, Subscripts, Sizes);
 
   return !Subscripts.empty();
 }
 
+static bool isKnownInRange(ScalarEvolution &SE, const SCEV *Subscript,
+                           const SCEV *Size, const Instruction *CtxI) {
+  Type *WiderTy = SE.getWiderType(Subscript->getType(), Size->getType());
+  Subscript = SE.getNoopOrSignExtend(Subscript, WiderTy);
+  Size = SE.getNoopOrSignExtend(Size, WiderTy);
+
+  auto IsKnownPredicate = [&](CmpPredicate Pred, const SCEV *LHS,
+                              const SCEV *RHS) {
+    return CtxI ? SE.isKnownPredicateAt(Pred, LHS, RHS, CtxI)
+                : SE.isKnownPredicate(Pred, LHS, RHS);
+  };
+
+  const SCEV *Zero = SE.getZero(WiderTy);
+  if (IsKnownPredicate(ICmpInst::ICMP_SGE, Subscript, Zero) &&
+      IsKnownPredicate(ICmpInst::ICMP_SLT, Subscript, Size))
+    return true;
+  return IsKnownPredicate(ICmpInst::ICMP_SGT, Size, Zero) &&
+         IsKnownPredicate(ICmpInst::ICMP_ULT, Subscript, Size);
+}
+
 bool llvm::validateDelinearizationResult(ScalarEvolution &SE,
                                          ArrayRef<const SCEV *> Sizes,
-                                         ArrayRef<const SCEV *> Subscripts) {
+                                         ArrayRef<const SCEV *> Subscripts,
+                                         DelinearizationShapeKind ShapeKind,
+                                         const Instruction *CtxI,
+                                         bool *UsedArrayExtents) {
+  if (UsedArrayExtents)
+    *UsedArrayExtents = false;
+
+  // With an unknown outer dimension there is one size per subscript. When an
+  // 'llvm.assume.chained' call states the complete array shape, Sizes
+  // additionally contains the known outer dimension.
+  bool HasKnownOuterDimension = ShapeKind == DelinearizationShapeKind::Complete;
+  size_t ExpectedSizeCount =
+      Subscripts.size() + (HasKnownOuterDimension ? 1 : 0);
+  if (Sizes.size() != ExpectedSizeCount || Subscripts.empty()) {
+    LLVM_DEBUG(dbgs() << "Delinearization validation failed: incompatible "
+                         "size and subscript counts\n");
+    return false;
+  }
+
+  // A language may let a subscript run past its own dimension and into the
+  // next, so staying inside each one has to be established rather than taken
+  // for granted. A language that forbids it can say so through
+  // 'llvm.assume.chained'. The carrier establishes the subscript ranges of a
+  // validly allocated array. The byte offset of an in-range access then lies
+  // inside the object, so the linearization is injective by construction and
+  // there is no overflow left to rule out. Rebuilding that argument from the
+  // IR fails for runtime extents, and the GEP no-wrap flags it could rely on
+  // are routinely dropped by earlier passes.
+  if (const CallBase *InRange = getArrayExtentsAssumption(CtxI);
+      InRange &&
+      describesRecoveredShape(SE, *InRange, Sizes, ShapeKind, CtxI)) {
+    if (UsedArrayExtents)
+      *UsedArrayExtents = true;
+    return true;
+  }
+
   // Sizes and Subscripts are as follows:
   //
   //   Sizes:      [UNK][S_2]...[S_n]
@@ -667,35 +946,41 @@ bool llvm::validateDelinearizationResult(ScalarEvolution &SE,
   // where the size of the outermost dimension is unknown (UNK).
 
   auto AddOverflow = [&](const SCEV *A, const SCEV *B) -> const SCEV * {
-    if (!SE.willNotOverflow(Instruction::Add, /*IsSigned=*/true, A, B))
+    if (!SE.willNotOverflow(Instruction::Add, /*IsSigned=*/true, A, B, CtxI))
       return nullptr;
     return SE.getAddExpr(A, B);
   };
 
   auto MulOverflow = [&](const SCEV *A, const SCEV *B) -> const SCEV * {
-    if (!SE.willNotOverflow(Instruction::Mul, /*IsSigned=*/true, A, B))
+    if (!SE.willNotOverflow(Instruction::Mul, /*IsSigned=*/true, A, B, CtxI))
       return nullptr;
     return SE.getMulExpr(A, B);
   };
 
-  // Range check: 0 <= I_k < S_k for k = 2..n.
-  for (size_t I = 1; I < Sizes.size(); ++I) {
-    const SCEV *Size = Sizes[I - 1];
-    const SCEV *Subscript = Subscripts[I];
-    if (!SE.isKnownNonNegative(Subscript))
-      return false;
+  auto IsKnownPredicate = [&](CmpPredicate Pred, const SCEV *LHS,
+                              const SCEV *RHS) {
+    return CtxI ? SE.isKnownPredicateAt(Pred, LHS, RHS, CtxI)
+                : SE.isKnownPredicate(Pred, LHS, RHS);
+  };
 
-    // TODO: It may be better that delinearization itself unifies the types of
-    // all elements in Sizes and Subscripts.
-    Type *WiderTy = SE.getWiderType(Subscript->getType(), Size->getType());
-    Subscript = SE.getNoopOrSignExtend(Subscript, WiderTy);
-    Size = SE.getNoopOrSignExtend(Size, WiderTy);
-    if (!SE.isKnownPredicate(ICmpInst::ICMP_SLT, Subscript, Size)) {
-      LLVM_DEBUG(dbgs() << "Range check failed: " << *Subscript << " <s "
-                        << *Size << "\n");
+  // Range check all dimensions whose sizes are known. Skip I_1 when the
+  // outermost dimension is unknown.
+  size_t FirstSubscript = HasKnownOuterDimension ? 0 : 1;
+  for (size_t I = FirstSubscript; I < Subscripts.size(); ++I) {
+    const SCEV *Size = Sizes[HasKnownOuterDimension ? I : I - 1];
+    const SCEV *Subscript = Subscripts[I];
+
+    if (!isKnownInRange(SE, Subscript, Size, CtxI)) {
+      LLVM_DEBUG(dbgs() << "Range check failed: could not prove 0 <= "
+                        << *Subscript << " < " << *Size << "\n");
       return false;
     }
   }
+
+  // A complete shape is only trusted together with the contract that states
+  // it; the reasoning below assumes an unknown outermost dimension.
+  if (HasKnownOuterDimension)
+    return false;
 
   // The offset computation is as follows:
   //
@@ -723,21 +1008,33 @@ bool llvm::validateDelinearizationResult(ScalarEvolution &SE,
   const SCEV *Prod = SE.getOne(Sizes[0]->getType());
   for (const SCEV *Size : Sizes) {
     Prod = MulOverflow(Prod, Size);
-    if (!Prod)
+    if (!Prod) {
+      LLVM_DEBUG(dbgs() << "Delinearization validation failed: dimension "
+                           "product may overflow\n");
       return false;
+    }
   }
   const SCEV *Min = MulOverflow(Prod, Subscripts[0]);
-  if (!Min)
+  if (!Min) {
+    LLVM_DEBUG(dbgs() << "Delinearization validation failed: minimum offset "
+                         "may overflow\n");
     return false;
+  }
 
   // We have already checked that Min and Prod don't overflow, so it's enough
   // to check whether Min + Prod - 1 doesn't overflow.
   const SCEV *MaxPlusOne = AddOverflow(Min, Prod);
-  if (!MaxPlusOne)
+  if (!MaxPlusOne) {
+    LLVM_DEBUG(dbgs() << "Delinearization validation failed: maximum offset "
+                         "may overflow\n");
     return false;
+  }
   if (!SE.willNotOverflow(Instruction::Sub, /*IsSigned=*/true, MaxPlusOne,
-                          SE.getOne(MaxPlusOne->getType())))
+                          SE.getOne(MaxPlusOne->getType()), CtxI)) {
+    LLVM_DEBUG(dbgs() << "Delinearization validation failed: final offset "
+                         "subtraction may overflow\n");
     return false;
+  }
 
   return true;
 }
@@ -831,12 +1128,14 @@ void printDelinearization(raw_ostream &O, Function *F, LoopInfo *LI,
     };
 
     delinearize(*SE, AccessFn, Subscripts, Sizes, SE->getElementSize(&Inst));
+    DelinearizationShapeKind ShapeKind =
+        DelinearizationShapeKind::UnknownOuterDimension;
     if (Opts.delinearize_use_fixed_size_array_heuristic &&
         IsDelinearizationFailed()) {
       Subscripts.clear();
       Sizes.clear();
       delinearizeFixedSizeArray(*SE, AccessFn, Subscripts, Sizes,
-                                SE->getElementSize(&Inst));
+                                SE->getElementSize(&Inst), ShapeKind);
     }
 
     if (IsDelinearizationFailed()) {
@@ -856,7 +1155,8 @@ void printDelinearization(raw_ostream &O, Function *F, LoopInfo *LI,
       O << "[" << *Subscripts[i] << "]";
     O << "\n";
 
-    bool IsValid = validateDelinearizationResult(*SE, Sizes, Subscripts);
+    bool IsValid =
+        validateDelinearizationResult(*SE, Sizes, Subscripts, ShapeKind, &Inst);
     O << "Delinearization validation: " << (IsValid ? "Succeeded" : "Failed")
       << "\n";
   }

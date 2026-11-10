@@ -637,7 +637,8 @@ bool CallBase::hasReadingOperandBundles() const {
                                      LLVMContext::OB_kcfi,
                                      LLVMContext::OB_convergencectrl,
                                      LLVMContext::OB_deactivation_symbol}) &&
-         getIntrinsicID() != Intrinsic::assume;
+         getIntrinsicID() != Intrinsic::assume &&
+         getIntrinsicID() != Intrinsic::assume_chained;
 }
 
 bool CallBase::hasClobberingOperandBundles() const {
@@ -646,7 +647,8 @@ bool CallBase::hasClobberingOperandBundles() const {
               LLVMContext::OB_ptrauth, LLVMContext::OB_kcfi,
               LLVMContext::OB_convergencectrl,
               LLVMContext::OB_deactivation_symbol}) &&
-         getIntrinsicID() != Intrinsic::assume;
+         getIntrinsicID() != Intrinsic::assume &&
+         getIntrinsicID() != Intrinsic::assume_chained;
 }
 
 MemoryEffects CallBase::getMemoryEffects() const {

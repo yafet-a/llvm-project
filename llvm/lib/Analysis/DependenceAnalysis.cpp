@@ -51,6 +51,7 @@
 #include "llvm/Analysis/Delinearization.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionDivision.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/InstIterator.h"
@@ -1710,6 +1711,60 @@ bool DependenceInfo::testMIV(const SCEV *Src, const SCEV *Dst,
          banerjeeMIVtest(Src, Dst, Loops, Result);
 }
 
+/// Return true when Expr is a two-level mixed-radix recurrence
+/// `Outer * TripCount(Inner) + Inner` that does not vary in any other loop of
+/// the nest rooted at \p Outermost. With no-wrap recurrences and a unit-step
+/// inner loop, this maps each pair of normalized loop iterations to a distinct
+/// integer.
+static bool isKnownInjectiveTwoLevelAddRec(const SCEV *Expr,
+                                           ScalarEvolution &SE,
+                                           const Loop *Outermost,
+                                           const Instruction *CtxI) {
+  const auto *InnerAR = dyn_cast<SCEVAddRecExpr>(Expr);
+  if (!Outermost || !InnerAR || !InnerAR->isAffine() ||
+      !InnerAR->hasNoSignedWrap())
+    return false;
+
+  const auto *OuterAR = dyn_cast<SCEVAddRecExpr>(InnerAR->getStart());
+  if (!OuterAR || !OuterAR->isAffine() || !OuterAR->hasNoSignedWrap() ||
+      !SE.isLoopInvariant(OuterAR->getStart(), Outermost))
+    return false;
+
+  const Loop *InnerLoop = InnerAR->getLoop();
+  const Loop *OuterLoop = OuterAR->getLoop();
+  if (!OuterLoop->contains(InnerLoop) ||
+      !InnerAR->getStepRecurrence(SE)->isOne())
+    return false;
+
+  const SCEV *InnerBTC = SE.getBackedgeTakenCount(InnerLoop);
+  if (isa<SCEVCouldNotCompute>(InnerBTC))
+    return false;
+
+  const SCEV *Radix = SE.getAddExpr(InnerBTC, SE.getOne(InnerBTC->getType()));
+  const SCEV *OuterStep = OuterAR->getStepRecurrence(SE);
+  return SE.isLoopInvariant(OuterStep, Outermost) && Radix == OuterStep &&
+         SE.isKnownPredicateAt(ICmpInst::ICMP_SGT, OuterStep,
+                               SE.getZero(OuterStep->getType()), CtxI);
+}
+
+/// Return the loop of an affine, no-wrap subscript that changes by exactly one
+/// element per iteration and does not vary in any other loop of the nest
+/// rooted at \p Outermost.
+static const Loop *getInjectiveUnitStrideLoop(const SCEV *Expr,
+                                              ScalarEvolution &SE,
+                                              const Loop *Outermost) {
+  const auto *AR = dyn_cast<SCEVAddRecExpr>(Expr);
+  if (!Outermost || !AR || !AR->isAffine() || !AR->hasNoSignedWrap() ||
+      !SE.isLoopInvariant(AR->getStart(), Outermost))
+    return nullptr;
+
+  const auto *Step = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+  if (!Step || (!Step->getAPInt().isOne() && !Step->getAPInt().isAllOnes()))
+    return nullptr;
+
+  return AR->getLoop();
+}
+
 /// Given a SCEVMulExpr, returns its first operand if its first operand is a
 /// constant and the product doesn't overflow in a signed sense. Otherwise,
 /// returns std::nullopt. For example, given (10 * X * Y)<nsw>, it returns 10.
@@ -2392,7 +2447,9 @@ void DependenceInfo::findBoundsGT(ArrayRef<CoefficientInfo> CI,
 /// this function flattens the nested recurrences into separate recurrences
 /// for each loop level.
 bool DependenceInfo::tryDelinearize(Instruction *Src, Instruction *Dst,
-                                    SmallVectorImpl<Subscript> &Pair) {
+                                    SmallVectorImpl<Subscript> &Pair,
+                                    bool &UsedArrayExtents) {
+  UsedArrayExtents = false;
   assert(isLoadOrStore(Src) && "instruction is not load or store");
   assert(isLoadOrStore(Dst) && "instruction is not load or store");
   Value *SrcPtr = getLoadStorePointerOperand(Src);
@@ -2412,9 +2469,11 @@ bool DependenceInfo::tryDelinearize(Instruction *Src, Instruction *Dst,
   SmallVector<const SCEV *, 4> SrcSubscripts, DstSubscripts;
 
   if (!tryDelinearizeFixedSize(Src, Dst, SrcAccessFn, DstAccessFn,
-                               SrcSubscripts, DstSubscripts) &&
+                               SrcSubscripts, DstSubscripts,
+                               UsedArrayExtents) &&
       !tryDelinearizeParametricSize(Src, Dst, SrcAccessFn, DstAccessFn,
-                                    SrcSubscripts, DstSubscripts))
+                                    SrcSubscripts, DstSubscripts,
+                                    UsedArrayExtents))
     return false;
 
   assert(isLoopInvariant(SrcBase, SrcLoop) &&
@@ -2451,10 +2510,13 @@ bool DependenceInfo::tryDelinearize(Instruction *Src, Instruction *Dst,
 /// Try to delinearize \p SrcAccessFn and \p DstAccessFn if the underlying
 /// arrays accessed are fixed-size arrays. Return true if delinearization was
 /// successful.
+static void reassertSubscriptNoWrap(ScalarEvolution &SE,
+                                    SmallVectorImpl<const SCEV *> &Subscripts);
+
 bool DependenceInfo::tryDelinearizeFixedSize(
     Instruction *Src, Instruction *Dst, const SCEV *SrcAccessFn,
     const SCEV *DstAccessFn, SmallVectorImpl<const SCEV *> &SrcSubscripts,
-    SmallVectorImpl<const SCEV *> &DstSubscripts) {
+    SmallVectorImpl<const SCEV *> &DstSubscripts, bool &UsedArrayExtents) {
   LLVM_DEBUG({
     const SCEVUnknown *SrcBase =
         dyn_cast<SCEVUnknown>(SE->getPointerBase(SrcAccessFn));
@@ -2467,15 +2529,16 @@ bool DependenceInfo::tryDelinearizeFixedSize(
   const SCEV *ElemSize = SE->getElementSize(Src);
   assert(ElemSize == SE->getElementSize(Dst) && "Different element sizes");
   SmallVector<const SCEV *, 4> SrcSizes, DstSizes;
-  if (!delinearizeFixedSizeArray(*SE, SE->removePointerBase(SrcAccessFn),
-                                 SrcSubscripts, SrcSizes, ElemSize) ||
-      !delinearizeFixedSizeArray(*SE, SE->removePointerBase(DstAccessFn),
-                                 DstSubscripts, DstSizes, ElemSize))
+  DelinearizationShapeKind SrcShapeKind, DstShapeKind;
+  if (!delinearizeFixedSizeArray(*SE, SrcAccessFn, SrcSubscripts, SrcSizes,
+                                 ElemSize, SrcShapeKind, Src) ||
+      !delinearizeFixedSizeArray(*SE, DstAccessFn, DstSubscripts, DstSizes,
+                                 ElemSize, DstShapeKind, Dst))
     return false;
 
   // Check that the two size arrays are non-empty and equal in length and
   // value.  SCEV expressions are uniqued, so we can compare pointers.
-  if (SrcSizes.size() != DstSizes.size() ||
+  if (SrcShapeKind != DstShapeKind || SrcSizes.size() != DstSizes.size() ||
       !std::equal(SrcSizes.begin(), SrcSizes.end(), DstSizes.begin())) {
     SrcSubscripts.clear();
     DstSubscripts.clear();
@@ -2493,12 +2556,26 @@ bool DependenceInfo::tryDelinearizeFixedSize(
   // iff the subscripts are positive and are less than the range of the
   // dimension.
   if (Opts.da_delinearization_checks) {
-    if (!validateDelinearizationResult(*SE, SrcSizes, SrcSubscripts) ||
-        !validateDelinearizationResult(*SE, DstSizes, DstSubscripts)) {
+    bool SrcUsedArrayExtents = false;
+    bool DstUsedArrayExtents = false;
+    if (!validateDelinearizationResult(*SE, SrcSizes, SrcSubscripts,
+                                       SrcShapeKind, Src,
+                                       &SrcUsedArrayExtents) ||
+        !validateDelinearizationResult(*SE, DstSizes, DstSubscripts,
+                                       DstShapeKind, Dst,
+                                       &DstUsedArrayExtents)) {
       SrcSubscripts.clear();
       DstSubscripts.clear();
       return false;
     }
+    UsedArrayExtents = SrcUsedArrayExtents && DstUsedArrayExtents;
+
+    // Validation showed each subscript stays within its dimension, so a
+    // unit-stride subscript cannot wrap. Restore the no-signed-wrap flag the
+    // element-size division dropped, which otherwise leaves the subscript
+    // classified NonLinear.
+    reassertSubscriptNoWrap(*SE, SrcSubscripts);
+    reassertSubscriptNoWrap(*SE, DstSubscripts);
   }
   LLVM_DEBUG({
     dbgs() << "Delinearized subscripts of fixed-size array\n"
@@ -2508,10 +2585,110 @@ bool DependenceInfo::tryDelinearizeFixedSize(
   return true;
 }
 
+// Recover array dimension sizes from the per-loop strides of a perfectly
+// nested affine AddRec. Unlike collectParametricTerms/findArrayDimensions,
+// which keep only the parametric part of a stride, this keeps the whole
+// stride. That matters for an extent of the form 1 + max(0, ub-lb), which is
+// what a Fortran dummy array with runtime bounds emits: its stride is
+// ElementSize * (1 + smax(0, ub-lb)), and dropping the additive constant would
+// recover the size as smax(0, ub-lb) rather than the true extent, leaving the
+// outer subscript entangled with the inner loop. Sizes[k] is the ratio of
+// consecutive strides; the innermost size is the element size. Returns false
+// (and the caller falls back to the term-based recovery) unless every stride
+// is an exact multiple of the next inner one.
+static bool computeSizesFromStrides(ScalarEvolution &SE, const SCEV *Expr,
+                                    const SCEV *ElementSize,
+                                    SmallVectorImpl<const SCEV *> &Sizes) {
+  SmallVector<const SCEV *, 4> Strides;
+  const SCEV *E = Expr;
+  while (const auto *AR = dyn_cast<SCEVAddRecExpr>(E)) {
+    if (!AR->isAffine())
+      return false;
+    Strides.push_back(AR->getStepRecurrence(SE));
+    E = AR->getStart();
+  }
+
+  // Need at least two dimensions to delinearize.
+  if (Strides.size() < 2)
+    return false;
+
+  auto Divide = [&](const SCEV *A, const SCEV *B) -> const SCEV * {
+    const SCEV *Q, *R;
+    SCEVDivision::divide(SE, A, B, &Q, &R);
+    if (!R->isZero() || Q->isZero())
+      return nullptr;
+    return Q;
+  };
+
+  // Convert byte strides to element strides. Besides removing the element
+  // size, dividing by that constant re-factors a stride of the form
+  // ElementSize * (1 + smax(0, ub-lb)) into the clean product (1 + smax(...)),
+  // which is what lets the ratio divisions below cancel a shared parametric
+  // extent factor (SCEV keeps such extents as Mul operands, but folds the
+  // element size into an additive form that would otherwise not cancel).
+  for (const SCEV *&S : Strides) {
+    if (const SCEV *Q = Divide(S, ElementSize))
+      S = Q;
+    else
+      return false;
+  }
+
+  // Order element strides from largest to smallest using exact divisibility: a
+  // stride that is an exact multiple of another is the larger of the two. For
+  // a conforming multidimensional access the strides form such a divisibility
+  // chain, so the loop-nesting order (which need not be monotonic in stride
+  // magnitude) does not matter.
+  auto IsMultipleOf = [&](const SCEV *A, const SCEV *B) {
+    return Divide(A, B) != nullptr;
+  };
+  llvm::stable_sort(Strides, [&](const SCEV *A, const SCEV *B) {
+    return IsMultipleOf(A, B) && !IsMultipleOf(B, A);
+  });
+
+  // Sizes[k] is the ratio of consecutive strides; the innermost size is the
+  // element size. Only accept parametric (non-constant) extents here: a
+  // constant ratio means either a fixed-size array, which the fixed-size path
+  // handles, or a linearized access with proportional coefficients (e.g.
+  // a[n*i + n*j], ratio one), which must be left to the Banerjee/MIV tests
+  // rather than split into a spurious dimension.
+  for (unsigned K = 0, N = Strides.size() - 1; K < N; ++K) {
+    const SCEV *Q = Divide(Strides[K], Strides[K + 1]);
+    if (!Q || isa<SCEVConstant>(Q))
+      return false;
+    Sizes.push_back(Q);
+  }
+  Sizes.push_back(ElementSize);
+  return true;
+}
+
+// Re-assert the no-signed-wrap flag on unit-stride delinearized subscripts.
+// The element-size division in computeAccessFunctions builds the quotient
+// recurrences with FlagAnyWrap, dropping nsw even for a canonical {start,+,1}
+// index, which checkSubscript then classifies as NonLinear.
+//
+// Only call this on subscripts known to satisfy 0 <= I < Size on every
+// iteration, either because validation proved it or because the in-range
+// guarantee states it. A recurrence with a step of +/-1 cannot wrap while
+// staying inside that range from one iteration to the next. A larger step
+// could wrap and land back in range, so those subscripts are left untouched.
+static void reassertSubscriptNoWrap(ScalarEvolution &SE,
+                                    SmallVectorImpl<const SCEV *> &Subscripts) {
+  for (const SCEV *&S : Subscripts) {
+    const auto *AR = dyn_cast<SCEVAddRecExpr>(S);
+    if (!AR || !AR->isAffine() || AR->hasNoSignedWrap())
+      continue;
+    const auto *Step = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+    if (!Step || (!Step->getAPInt().isOne() && !Step->getAPInt().isAllOnes()))
+      continue;
+    S = SE.getAddRecExpr(AR->getStart(), AR->getStepRecurrence(SE),
+                         AR->getLoop(), SCEV::FlagNSW);
+  }
+}
+
 bool DependenceInfo::tryDelinearizeParametricSize(
     Instruction *Src, Instruction *Dst, const SCEV *SrcAccessFn,
     const SCEV *DstAccessFn, SmallVectorImpl<const SCEV *> &SrcSubscripts,
-    SmallVectorImpl<const SCEV *> &DstSubscripts) {
+    SmallVectorImpl<const SCEV *> &DstSubscripts, bool &UsedArrayExtents) {
 
   const SCEVUnknown *SrcBase =
       dyn_cast<SCEVUnknown>(SE->getPointerBase(SrcAccessFn));
@@ -2532,14 +2709,20 @@ bool DependenceInfo::tryDelinearizeParametricSize(
   if (!SrcAR || !DstAR || !SrcAR->isAffine() || !DstAR->isAffine())
     return false;
 
-  // First step: collect parametric terms in both array references.
-  SmallVector<const SCEV *, 4> Terms;
-  collectParametricTerms(*SE, SrcAR, Terms);
-  collectParametricTerms(*SE, DstAR, Terms);
-
-  // Second step: find subscript sizes.
+  // Second step: find subscript sizes. Prefer recovering them from the strides
+  // directly, which keeps extents of the form 1 + max(0, ub-lb) intact; fall
+  // back to the term/GCD based recovery when that does not apply.
   SmallVector<const SCEV *, 4> Sizes;
-  findArrayDimensions(*SE, Terms, Sizes, ElementSize);
+  if (!computeSizesFromStrides(*SE, SrcAR, ElementSize, Sizes)) {
+    Sizes.clear();
+
+    // First step: collect parametric terms in both array references.
+    SmallVector<const SCEV *, 4> Terms;
+    collectParametricTerms(*SE, SrcAR, Terms);
+    collectParametricTerms(*SE, DstAR, Terms);
+
+    findArrayDimensions(*SE, Terms, Sizes, ElementSize);
+  }
 
   // Third step: compute the access functions for each subscript.
   computeAccessFunctions(*SE, SrcAR, SrcSubscripts, Sizes);
@@ -2556,10 +2739,27 @@ bool DependenceInfo::tryDelinearizeParametricSize(
   // and dst.
   // FIXME: It may be better to record these sizes and add them as constraints
   // to the dependency checks.
-  if (Opts.da_delinearization_checks)
-    if (!validateDelinearizationResult(*SE, Sizes, SrcSubscripts) ||
-        !validateDelinearizationResult(*SE, Sizes, DstSubscripts))
+  if (Opts.da_delinearization_checks) {
+    bool SrcUsedArrayExtents = false;
+    bool DstUsedArrayExtents = false;
+    if (!validateDelinearizationResult(
+            *SE, Sizes, SrcSubscripts,
+            DelinearizationShapeKind::UnknownOuterDimension, Src,
+            &SrcUsedArrayExtents) ||
+        !validateDelinearizationResult(
+            *SE, Sizes, DstSubscripts,
+            DelinearizationShapeKind::UnknownOuterDimension, Dst,
+            &DstUsedArrayExtents))
       return false;
+    UsedArrayExtents = SrcUsedArrayExtents && DstUsedArrayExtents;
+
+    // Validation showed each subscript stays within its dimension, so a
+    // unit-stride subscript cannot wrap. Restore the no-signed-wrap flag the
+    // element-size division dropped, which otherwise leaves the subscript
+    // classified NonLinear.
+    reassertSubscriptNoWrap(*SE, SrcSubscripts);
+    reassertSubscriptNoWrap(*SE, DstSubscripts);
+  }
 
   return true;
 }
@@ -2622,6 +2822,11 @@ DependenceInfo::depends(Instruction *Src, Instruction *Dst,
 
   const MemoryLocation &DstLoc = MemoryLocation::get(Dst);
   const MemoryLocation &SrcLoc = MemoryLocation::get(Src);
+
+  if (arrayExtentsProveDisjoint(*SE, Src, Dst)) {
+    LLVM_DEBUG(dbgs() << "access-scoped array subobjects do not alias\n");
+    return nullptr;
+  }
 
   switch (underlyingObjectsAlias(AA, F->getDataLayout(), DstLoc, SrcLoc)) {
   case AliasResult::MayAlias:
@@ -2699,10 +2904,13 @@ DependenceInfo::depends(Instruction *Src, Instruction *Dst,
   SmallVector<Subscript, 2> Pair(Pairs);
   Pair[0].Src = SrcEv;
   Pair[0].Dst = DstEv;
+  bool HasValidatedDelinearization = false;
+  bool UsedArrayExtents = false;
   if (Opts.da_delinearize) {
-    if (tryDelinearize(Src, Dst, Pair)) {
+    if (tryDelinearize(Src, Dst, Pair, UsedArrayExtents)) {
       LLVM_DEBUG(dbgs() << "    delinearized\n");
       Pairs = Pair.size();
+      HasValidatedDelinearization = Opts.da_delinearization_checks;
     }
   }
 
@@ -2754,6 +2962,32 @@ DependenceInfo::depends(Instruction *Src, Instruction *Dst,
     LLVM_DEBUG(dbgs() << "\tclass = " << Pair[P].Classification << "\n");
     LLVM_DEBUG(dbgs() << "\tloops = ");
     LLVM_DEBUG(dumpSmallBitVector(Pair[P].Loops));
+
+    // A validated delinearization is injective from its subscript tuple to the
+    // flat address. For a self-access, an injective recurrence additionally
+    // proves equality in the loops it maps one-to-one.
+    if (Src == Dst && HasValidatedDelinearization &&
+        Pair[P].Src == Pair[P].Dst) {
+      const Loop *Outermost = SrcLoop ? SrcLoop->getOutermostLoop() : nullptr;
+      const Loop *L = nullptr;
+      if (UsedArrayExtents)
+        L = getInjectiveUnitStrideLoop(Pair[P].Src, *SE, Outermost);
+      if (L) {
+        unsigned Level = mapSrcLoop(L);
+        if (Level > 0 && Level <= CommonLevels) {
+          LLVM_DEBUG(dbgs() << "\tunit-stride subscript is injective\n");
+          Pair[P].Loops.set(Level);
+          Result.DV[Level - 1].Direction &= Dependence::DVEntry::EQ;
+        }
+      }
+
+      if (isKnownInjectiveTwoLevelAddRec(Pair[P].Src, *SE, Outermost, Src)) {
+        LLVM_DEBUG(dbgs() << "\ttwo-level subscript is injective\n");
+        for (unsigned Level : Pair[P].Loops.set_bits())
+          if (Level > 0 && Level <= CommonLevels)
+            Result.DV[Level - 1].Direction &= Dependence::DVEntry::EQ;
+      }
+    }
   }
 
   // Test each subscript individually

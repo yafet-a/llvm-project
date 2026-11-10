@@ -3279,6 +3279,7 @@ bool IRTranslatorImpl::translateKnownIntrinsic(const CallInst &CI,
   case Intrinsic::expect_with_probability:
   case Intrinsic::annotation:
   case Intrinsic::ptr_annotation:
+  case Intrinsic::assume_chained:
   case Intrinsic::launder_invariant_group:
   case Intrinsic::threadlocal_address: {
     // Drop the intrinsic, but forward the value.

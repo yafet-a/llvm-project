@@ -7436,6 +7436,8 @@ bool llvm::isIntrinsicReturningPointerAliasingArgumentWithoutCapturing(
     const CallBase *Call, bool MustPreserveOffset,
     bool MustPreserveProvenance) {
   switch (Call->getIntrinsicID()) {
+  case Intrinsic::assume_chained:
+    return true;
   case Intrinsic::launder_invariant_group:
   case Intrinsic::aarch64_irg:
   case Intrinsic::aarch64_tagp:

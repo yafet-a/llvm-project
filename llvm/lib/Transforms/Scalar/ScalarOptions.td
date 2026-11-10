@@ -283,6 +283,8 @@ defm : ValueField<"loop-interchange-max-loop-nest-depth", "unsigned", "10",
   "Maximum depth of loop nest considered for the transform">;
 defm : ValueField<"loop-interchange-max-mem-instr-ratio", "unsigned", "4",
   "Maximum number of load/store instructions squared in relation to the total number of instructions. Higher value may lead to more interchanges at the cost of compile-time">;
+defm : BoolField<"loop-interchange-allow-inner-invariant-loads", "false",
+  "Permit an inner-loop-invariant load between the loops of a candidate nest">;
 // Minimum loop depth supported.
 defm : ValueField<"loop-interchange-min-loop-nest-depth", "unsigned", "2",
   "Minimum depth of loop nest considered for the transform">;
