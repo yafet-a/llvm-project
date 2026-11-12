@@ -87,6 +87,10 @@ struct FIRToLLVMPassOptions {
   // malloc -> malloc_unified. Lets a runtime name its entry points otherwise.
   std::string unifiedHeapAllocSuffix = "_unified";
   std::string managedHeapAllocSuffix = "_managed";
+
+  // State the extents of an array, through array.extents assume bundles, at
+  // the accesses whose subscripts must stay within them.
+  bool emitArrayExtents = false;
 };
 
 /// Convert FIR to the LLVM IR dialect with default options.

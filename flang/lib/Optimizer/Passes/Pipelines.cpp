@@ -121,6 +121,9 @@ getFIRToLLVMPassOptions(const MLIRToLLVMPassPipelineConfig &config) {
   options.typeDescriptorsRenamedForAssembly =
       !disableCompilerGeneratedNamesConversion;
   options.ComplexRange = config.ComplexRange;
+  // Only the loop optimizations, which run at -O2 and above, make use of it.
+  options.emitArrayExtents = enableArrayExtentsAssumption &&
+                             config.OptLevel >= llvm::OptimizationLevel::O2;
   return options;
 }
 

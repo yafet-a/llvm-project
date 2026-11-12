@@ -49,6 +49,12 @@ cl::opt<bool> skipExternalRttiDefinition(
 llvm::cl::opt<bool> forceNoAlias("force-no-alias", llvm::cl::Hidden,
                                  llvm::cl::init(true));
 
+cl::opt<bool> enableArrayExtentsAssumption(
+    "enable-array-extents-assumption",
+    cl::desc("state the extents of an array at the accesses whose subscripts "
+             "must stay within them (only at -O2 and above)"),
+    cl::init(false), cl::Hidden);
+
 OptimizationLevel defaultOptLevel{OptimizationLevel::O0};
 
 codegenoptions::DebugInfoKind noDebugInfo{codegenoptions::NoDebugInfo};

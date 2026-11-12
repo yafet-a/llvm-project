@@ -3263,6 +3263,62 @@ struct InsertOnRangeOpConversion
 };
 } // namespace
 
+/// Marks an array coordinate whose element access is covered by an
+/// array.extents assume bundle.
+static constexpr llvm::StringLiteral inRangeSubscriptsAttrName =
+    "fir.in_range_subscripts";
+
+/// Return whether the frontend can state a complete in-range array contract
+/// for \p coor. Boxed arrays carry their extents in the descriptor; unboxed
+/// arrays must have an explicit, non-assumed-size shape.
+static bool hasInRangeSubscripts(fir::cg::XArrayCoorOp coor) {
+  if (!coor.getSubcomponent().empty() || !coor.getLenParams().empty())
+    return false;
+  if (!mlir::isa<fir::BaseBoxType>(coor.getMemref().getType())) {
+    if (coor.getShape().empty() ||
+        llvm::isa_and_nonnull<fir::AssumedSizeExtentOp>(
+            coor.getShape().back().getDefiningOp()))
+      return false;
+  }
+  return true;
+}
+
+/// State the complete extents of \p base without replacing the pointer in its
+/// def-use chain.
+static void emitArrayExtentsAssume(const fir::LLVMTypeConverter &converter,
+                                   mlir::Location loc, mlir::Value base,
+                                   mlir::Value access, mlir::ValueRange extents,
+                                   mlir::ValueRange strides,
+                                   mlir::ConversionPatternRewriter &rewriter) {
+  mlir::Type i64Ty = rewriter.getI64Type();
+  llvm::SmallVector<mlir::Value> extentArgs;
+  extentArgs.reserve(extents.size() + 2);
+  extentArgs.push_back(access);
+  extentArgs.push_back(base);
+  for (mlir::Value extent : extents)
+    extentArgs.push_back(
+        fir::integerCast(converter, loc, rewriter, i64Ty, extent));
+  llvm::SmallVector<mlir::Value> strideArgs;
+  if (!strides.empty()) {
+    strideArgs.reserve(strides.size() + 1);
+    strideArgs.push_back(access);
+    for (mlir::Value stride : strides)
+      strideArgs.push_back(
+          fir::integerCast(converter, loc, rewriter, i64Ty, stride));
+  }
+  mlir::Value trueValue =
+      mlir::LLVM::ConstantOp::create(rewriter, loc, rewriter.getI1Type(), 1);
+  llvm::SmallVector<mlir::ValueRange, 2> bundles{extentArgs};
+  llvm::SmallVector<mlir::Attribute, 2> tags{
+      rewriter.getStringAttr("array.extents")};
+  if (!strideArgs.empty()) {
+    bundles.push_back(strideArgs);
+    tags.push_back(rewriter.getStringAttr("array.strides"));
+  }
+  mlir::LLVM::AssumeOp::create(rewriter, loc, trueValue, bundles,
+                               rewriter.getArrayAttr(tags));
+}
+
 namespace {
 /// XArrayCoor is the address arithmetic on a dynamically shaped, sliced,
 /// shifted etc. array.
@@ -3310,6 +3366,9 @@ struct XArrayCoorOpConversion
     mlir::LLVM::IntegerOverflowFlags addMulFlags = nsw | nuw;
     mlir::LLVM::GEPNoWrapFlags gepFlags =
         mlir::LLVM::GEPNoWrapFlags::nusw | mlir::LLVM::GEPNoWrapFlags::nuw;
+    const bool emitArrayExtents = coor->hasAttr(inRangeSubscriptsAttrName);
+    llvm::SmallVector<mlir::Value> extents;
+    llvm::SmallVector<mlir::Value> strides;
 
     // For each dimension of the array, generate the offset calculation.
     for (unsigned i = 0; i < rank; ++i, ++indexOffset, ++shapeOffset,
@@ -3319,6 +3378,7 @@ struct XArrayCoorOpConversion
       mlir::Value lb =
           isShifted ? integerCast(loc, rewriter, idxTy, operands[shiftOffset])
                     : one;
+
       mlir::Value step = one;
       bool normalSlice = isSliced;
       // Compute zero based index in dimension i of the element, applying
@@ -3363,6 +3423,12 @@ struct XArrayCoorOpConversion
             mlir::LLVM::MulOp::create(rewriter, loc, idxTy, diff, stride, nsw);
         offset =
             mlir::LLVM::AddOp::create(rewriter, loc, idxTy, sc, offset, nsw);
+        if (emitArrayExtents) {
+          extents.push_back(getDimFieldFromBox(loc, baseBoxTyPair, operands[0],
+                                               i, kDimExtentPos, idxTy,
+                                               rewriter));
+          strides.push_back(stride);
+        }
       } else {
         // Use stride computed at last iteration.
         auto sc = mlir::LLVM::MulOp::create(rewriter, loc, idxTy, diff, prevExt,
@@ -3374,6 +3440,8 @@ struct XArrayCoorOpConversion
         auto nextExt = integerCast(loc, rewriter, idxTy, operands[shapeOffset]);
         prevExt = mlir::LLVM::MulOp::create(rewriter, loc, idxTy, prevExt,
                                             nextExt, addMulFlags);
+        if (emitArrayExtents)
+          extents.push_back(nextExt);
       }
     }
 
@@ -3388,6 +3456,9 @@ struct XArrayCoorOpConversion
       auto addr =
           mlir::LLVM::GEPOp::create(rewriter, loc, llvmPtrTy, byteTy, base,
                                     args, mlir::LLVM::GEPNoWrapFlags::nusw);
+      if (emitArrayExtents)
+        emitArrayExtentsAssume(lowerTy(), loc, base, addr, extents, strides,
+                               rewriter);
       if (coor.getSubcomponent().empty()) {
         rewriter.replaceOp(coor, addr);
         return mlir::success();
@@ -3450,8 +3521,13 @@ struct XArrayCoorOpConversion
                          coor.getSubcomponent().size()));
       args.append(indices.begin(), indices.end());
     }
-    rewriter.replaceOpWithNewOp<mlir::LLVM::GEPOp>(
-        coor, llvmPtrTy, gepObjectType, adaptor.getMemref(), args, gepFlags);
+    auto addr =
+        mlir::LLVM::GEPOp::create(rewriter, loc, llvmPtrTy, gepObjectType,
+                                  adaptor.getMemref(), args, gepFlags);
+    if (emitArrayExtents)
+      emitArrayExtentsAssume(lowerTy(), loc, adaptor.getMemref(), addr, extents,
+                             {}, rewriter);
+    rewriter.replaceOp(coor, addr);
     return mlir::success();
   }
 };
@@ -5270,6 +5346,15 @@ public:
       signalPassFailure();
       return;
     }
+
+    // Eligibility depends on the FIR use graph, which conversion rewrites.
+    // Record it before applying any conversion patterns.
+    if (options.emitArrayExtents)
+      mod.walk([](fir::cg::XArrayCoorOp coor) {
+        if (hasInRangeSubscripts(coor))
+          coor->setAttr(inRangeSubscriptsAttrName,
+                        mlir::UnitAttr::get(coor.getContext()));
+      });
 
     auto *context = getModule().getContext();
     fir::LLVMTypeConverter typeConverter{getModule(),
