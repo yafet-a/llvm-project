@@ -595,8 +595,10 @@ FUNCTION_PASS_WITH_PARAMS(
     parseInferAddressSpacesPassOptions, "assume-default-is-flat-addrspace")
 FUNCTION_PASS_WITH_PARAMS(
     "drop-unnecessary-assumes", "DropUnnecessaryAssumesPass",
-    [](bool DropDereferenceable) { return DropUnnecessaryAssumesPass(DropDereferenceable); },
-    parseDropUnnecessaryAssumesPassOptions, "drop-deref")
+    [](std::pair<bool, bool> Params) {
+      return DropUnnecessaryAssumesPass(Params.first, Params.second);
+    },
+    parseDropUnnecessaryAssumesPassOptions, "drop-deref;array-extents-only")
 FUNCTION_PASS_WITH_PARAMS(
     "ee-instrument", "EntryExitInstrumenterPass",
     [](bool PostInlining) { return EntryExitInstrumenterPass(PostInlining); },

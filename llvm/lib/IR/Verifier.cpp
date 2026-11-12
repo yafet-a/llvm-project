@@ -6394,6 +6394,36 @@ void Verifier::visitIntrinsicCall(Intrinsic::ID ID, CallBase &Call) {
               "bits if present",
               Call);
         break;
+      case BundleAttr::ArrayExtents:
+        Check(OBU.Inputs.size() >= 3,
+              "array.extents assumptions should have an access, a base and at "
+              "least one extent",
+              Call);
+        if (OBU.Inputs.size() < 3)
+          break;
+        Check(GetTypeAt(0)->isPointerTy() && GetTypeAt(1)->isPointerTy(),
+              "array.extents access and base should be pointers", Call);
+        for (unsigned I = 2; I < OBU.Inputs.size(); ++I) {
+          Check(GetTypeAt(I)->isIntegerTy(64),
+                "array.extents extents should be i64", Call);
+          if (auto *Extent = dyn_cast<ConstantInt>(OBU.Inputs[I]))
+            Check(Extent->getValue().isStrictlyPositive(),
+                  "constant array.extents extents should be positive", Call);
+        }
+        break;
+      case BundleAttr::ArrayStrides:
+        Check(OBU.Inputs.size() >= 2,
+              "array.strides assumptions should have an access and at least "
+              "one stride",
+              Call);
+        if (OBU.Inputs.empty())
+          break;
+        Check(GetTypeAt(0)->isPointerTy(),
+              "array.strides access should be a pointer", Call);
+        for (unsigned I = 1; I < OBU.Inputs.size(); ++I)
+          Check(GetTypeAt(I)->isIntegerTy(64),
+                "array.strides strides should be i64", Call);
+        break;
       case BundleAttr::Cold:
         Check(OBU.Inputs.size() == 0,
               "cold assumptions should have no arguments", Call);
@@ -6447,6 +6477,23 @@ void Verifier::visitIntrinsicCall(Intrinsic::ID ID, CallBase &Call) {
               Call);
         break;
       }
+    }
+    for (OperandBundleUse Strides : Call.operand_bundles()) {
+      if (getBundleAttrFromOBU(Strides) != BundleAttr::ArrayStrides ||
+          Strides.Inputs.empty())
+        continue;
+      bool Matched = false;
+      for (OperandBundleUse Extents : Call.operand_bundles())
+        if (getBundleAttrFromOBU(Extents) == BundleAttr::ArrayExtents &&
+            Extents.Inputs.size() >= 3 &&
+            Extents.Inputs[0].get() == Strides.Inputs[0].get()) {
+          Check(Extents.Inputs.size() == Strides.Inputs.size() + 1,
+                "array.extents and array.strides ranks should match", Call);
+          Matched = true;
+          break;
+        }
+      Check(Matched, "array.strides needs array.extents for the same access",
+            Call);
     }
     break;
   }

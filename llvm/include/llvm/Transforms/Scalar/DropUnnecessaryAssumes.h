@@ -19,8 +19,12 @@ namespace llvm {
 
 struct DropUnnecessaryAssumesPass
     : public OptionalPassInfoMixin<DropUnnecessaryAssumesPass> {
-  DropUnnecessaryAssumesPass(bool DropDereferenceable = false)
-      : DropDereferenceable(DropDereferenceable) {}
+  /// With \p OnlyArrayExtents, drop the array contract bundles and leave
+  /// every other assume alone.
+  DropUnnecessaryAssumesPass(bool DropDereferenceable = false,
+                             bool OnlyArrayExtents = false)
+      : DropDereferenceable(DropDereferenceable),
+        OnlyArrayExtents(OnlyArrayExtents) {}
 
   LLVM_ABI PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
   LLVM_ABI void
@@ -29,6 +33,7 @@ struct DropUnnecessaryAssumesPass
 
 private:
   bool DropDereferenceable;
+  bool OnlyArrayExtents;
 };
 
 } // end namespace llvm

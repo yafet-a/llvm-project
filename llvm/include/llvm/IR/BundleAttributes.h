@@ -9,6 +9,7 @@
 #ifndef LLVM_IR_BUNDLE_ATTRIBUTES_H
 #define LLVM_IR_BUNDLE_ATTRIBUTES_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/InstrTypes.h"
@@ -37,6 +38,21 @@ struct AssumeAlignInfo {
 };
 
 LLVM_ABI AssumeAlignInfo getAssumeAlignInfo(OperandBundleUse);
+
+struct AssumeArrayExtentsInfo {
+  const Use &Access;
+  const Use &Base;
+  ArrayRef<Use> Extents;
+};
+
+LLVM_ABI AssumeArrayExtentsInfo getAssumeArrayExtentsInfo(OperandBundleUse);
+
+struct AssumeArrayStridesInfo {
+  const Use &Access;
+  ArrayRef<Use> Strides;
+};
+
+LLVM_ABI AssumeArrayStridesInfo getAssumeArrayStridesInfo(OperandBundleUse);
 
 struct AssumeDereferenceableInfo {
   const Use &Ptr;

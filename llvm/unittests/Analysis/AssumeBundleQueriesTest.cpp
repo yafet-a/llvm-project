@@ -9,6 +9,7 @@
 #include "llvm/Analysis/AssumeBundleQueries.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/IR/BundleAttributes.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -269,6 +270,40 @@ TEST(AssumeQueryAPI, AssumptionCache) {
   ASSERT_EQ(AR.size(), 1u);
   ASSERT_EQ(AR[0].Index, 1u);
   ASSERT_EQ(AR[0].Assume, &*First);
+}
+
+TEST(AssumeQueryAPI, ArrayContractsAreIndexedByAccess) {
+  LLVMContext C;
+  SMDiagnostic Err;
+  std::unique_ptr<Module> Mod = parseAssemblyString(
+      "declare void @llvm.assume(i1)\n"
+      "define void @test(ptr %A, ptr %P, ptr %Replacement, i64 %N) {\n"
+      "call void @llvm.assume(i1 true) "
+      "[\"array.extents\"(ptr %P, ptr %A, i64 %N, i64 8), "
+      "\"array.strides\"(ptr %P, i64 8, i64 64)]\n"
+      "ret void\n}\n",
+      Err, C);
+  ASSERT_TRUE(Mod);
+
+  Function *F = Mod->getFunction("test");
+  Value *Base = F->getArg(0);
+  Value *Access = F->getArg(1);
+  Value *Replacement = F->getArg(2);
+  AssumptionCache AC(*F);
+
+  EXPECT_TRUE(AC.assumptionsFor(Base).empty());
+  auto AccessAssumes = AC.assumptionsFor(Access);
+  ASSERT_EQ(AccessAssumes.size(), 2u);
+  EXPECT_EQ(AccessAssumes[0].Index, 0u);
+  EXPECT_EQ(AccessAssumes[1].Index, 1u);
+
+  Access->replaceAllUsesWith(Replacement);
+  EXPECT_TRUE(AC.assumptionsFor(Access).empty());
+  // The transfer keeps one entry per assume, which must be the extents.
+  auto ReplacementAssumes = AC.assumptionsFor(Replacement);
+  ASSERT_EQ(ReplacementAssumes.size(), 1u);
+  EXPECT_EQ(ReplacementAssumes[0].Index, 0u);
+  EXPECT_TRUE(AC.assumptionsFor(Base).empty());
 }
 
 TEST(AssumeQueryAPI, Alignment) {

@@ -1441,6 +1441,25 @@ bb:
   ret ptr null
 }
 
+define void @preserve_array_extents(ptr %base, i64 %n, ptr %p) {
+; CHECK-LABEL: @preserve_array_extents(
+; CHECK-NEXT: call void @llvm.assume(i1 true) [ "array.extents"(ptr [[P:%.*]], ptr [[BASE:%.*]], i64 [[N:%.*]], i64 8) ]
+; CHECK-NEXT: ret void
+  call void @llvm.assume(i1 true) [ "array.extents"(ptr %p, ptr %base, i64 %n, i64 8) ]
+  ret void
+}
+
+; Each contract names its access, so contracts merge like any other bundles.
+define void @merge_array_contracts(ptr %base, i64 %n, ptr %p, ptr %q) {
+; CHECK-LABEL: @merge_array_contracts(
+; CHECK-NEXT: call void @llvm.assume(i1 true) [ "array.extents"(ptr [[P:%.*]], ptr [[BASE:%.*]], i64 [[N:%.*]]), "array.extents"(ptr [[Q:%.*]], ptr [[BASE]], i64 [[N]]), "nonnull"(ptr [[BASE]]) ]
+; CHECK-NEXT: ret void
+  call void @llvm.assume(i1 true) [ "array.extents"(ptr %p, ptr %base, i64 %n) ]
+  call void @llvm.assume(i1 true) [ "array.extents"(ptr %q, ptr %base, i64 %n) ]
+  call void @llvm.assume(i1 true) [ "nonnull"(ptr %base) ]
+  ret void
+}
+
 declare void @use(i1)
 declare void @block()
 declare void @llvm.dbg.value(metadata, metadata, metadata)

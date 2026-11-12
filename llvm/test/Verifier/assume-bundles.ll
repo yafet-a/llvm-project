@@ -31,6 +31,37 @@ define void @func(ptr %P, i32 %P1, ptr %P2, ptr %P3, i1 %cond) {
 ; CHECK: third argument should be an integer with a maximum width of 64 bits if present
   call void @llvm.assume(i1 true) ["align"(ptr %P, i32 %P1, i65 1)]
 
+; ArrayExtents checks
+;
+; CHECK: array.extents assumptions should have an access, a base and at least one extent
+  call void @llvm.assume(i1 true) ["array.extents"(ptr %P2, ptr %P)]
+; CHECK: array.extents access and base should be pointers
+  call void @llvm.assume(i1 true) ["array.extents"(ptr %P2, i64 0, i64 4)]
+; CHECK: array.extents access and base should be pointers
+  call void @llvm.assume(i1 true) ["array.extents"(i64 0, ptr %P, i64 4)]
+; CHECK: array.extents extents should be i64
+  call void @llvm.assume(i1 true) ["array.extents"(ptr %P2, ptr %P, i32 4)]
+; CHECK: constant array.extents extents should be positive
+  call void @llvm.assume(i1 true) ["array.extents"(ptr %P2, ptr %P, i64 0)]
+; CHECK: constant array.extents extents should be positive
+  call void @llvm.assume(i1 true) ["array.extents"(ptr %P2, ptr %P, i64 -1)]
+  call void @llvm.assume(i1 true) ["array.extents"(ptr %P2, ptr %P, i64 4, i64 8)]
+
+; ArrayStrides checks
+;
+; CHECK: array.strides assumptions should have an access and at least one stride
+  call void @llvm.assume(i1 true) ["array.strides"(ptr %P)]
+; CHECK: array.strides access should be a pointer
+  call void @llvm.assume(i1 true) ["array.strides"(i64 0, i64 8)]
+; CHECK: array.strides strides should be i64
+  call void @llvm.assume(i1 true) ["array.extents"(ptr %P2, ptr %P, i64 10), "array.strides"(ptr %P2, i32 8)]
+; CHECK: array.strides needs array.extents for the same access
+  call void @llvm.assume(i1 true) ["array.extents"(ptr %P2, ptr %P, i64 10), "array.strides"(ptr %P, i64 8)]
+; CHECK: array.extents and array.strides ranks should match
+  call void @llvm.assume(i1 true) ["array.extents"(ptr %P2, ptr %P, i64 10, i64 20), "array.strides"(ptr %P2, i64 8)]
+  call void @llvm.assume(i1 true) ["array.extents"(ptr %P2, ptr %P, i64 10, i64 20), "array.strides"(ptr %P2, i64 8, i64 80)]
+  call void @llvm.assume(i1 true) ["array.extents"(ptr %P2, ptr %P, i64 10), "array.extents"(ptr %P, ptr %P, i64 20)]
+
 ; Cold checks
 ;
 ; CHECK: cold assumptions should have no arguments

@@ -52,6 +52,18 @@ AssumeAlignInfo llvm::getAssumeAlignInfo(OperandBundleUse OBU) {
   return Ret;
 }
 
+AssumeArrayExtentsInfo llvm::getAssumeArrayExtentsInfo(OperandBundleUse OBU) {
+  assert(OBU.getTagID() == LLVMContext::OB_ArrayExtents &&
+         OBU.Inputs.size() >= 3);
+  return {OBU.Inputs[0], OBU.Inputs[1], OBU.Inputs.drop_front(2)};
+}
+
+AssumeArrayStridesInfo llvm::getAssumeArrayStridesInfo(OperandBundleUse OBU) {
+  assert(OBU.getTagID() == LLVMContext::OB_ArrayStrides &&
+         OBU.Inputs.size() >= 2);
+  return {OBU.Inputs[0], OBU.Inputs.drop_front()};
+}
+
 AssumeNoUndefInfo llvm::getAssumeNoUndefInfo(OperandBundleUse OBU) {
   assert(OBU.getTagID() == LLVMContext::OB_NoUndef && OBU.Inputs.size() == 1);
   return {OBU.Inputs[0]};

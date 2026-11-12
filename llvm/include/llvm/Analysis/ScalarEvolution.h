@@ -670,6 +670,8 @@ public:
   LLVM_ABI ~ScalarEvolution();
 
   LLVMContext &getContext() const { return F.getContext(); }
+  AssumptionCache &getAssumptionCache() const { return AC; }
+  DominatorTree &getDominatorTree() const { return DT; }
 
   Module &getModule() const { return *F.getParent(); }
 

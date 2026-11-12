@@ -61,6 +61,7 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Analysis/VectorUtils.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/BundleAttributes.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
@@ -5675,6 +5676,25 @@ bool InstCombinerImpl::tryToSinkInstruction(Instruction *I,
          Scan != E; ++Scan)
       if (Scan->mayWriteToMemory() && !isa<AssumeInst>(Scan))
         return false;
+  }
+
+  // Sinking drops every droppable use outside DestBlock. For an assume that
+  // would turn a whole array contract bundle into "ignore", so an access loses
+  // its extents just because the extent load has a single real use elsewhere.
+  // Keep such values where the contract can still see them.
+  for (const Use &U : I->uses()) {
+    auto *Assume = dyn_cast<AssumeInst>(U.getUser());
+    if (!Assume || Assume->getParent() == DestBlock ||
+        !Assume->isBundleOperand(&U))
+      continue;
+    switch (getBundleAttrFromOBU(
+        Assume->getOperandBundleForOperand(U.getOperandNo()))) {
+    case BundleAttr::ArrayExtents:
+    case BundleAttr::ArrayStrides:
+      return false;
+    default:
+      break;
+    }
   }
 
   SmallVector<AssumeInst *, 2> AssumesToSink;

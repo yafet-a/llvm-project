@@ -1528,6 +1528,10 @@ PassBuilder::buildModuleOptimizationPipeline(OptimizationLevel Level,
   OptimizePM.addPass(
       createFunctionToLoopPassAdaptor(std::move(LPM), /*UseMemorySSA=*/false));
 
+  if (*PTO.LoopInterchange)
+    OptimizePM.addPass(DropUnnecessaryAssumesPass(/*DropDereferenceable=*/false,
+                                                  /*OnlyArrayExtents=*/true));
+
   // FIXME: This may not be the right place in the pipeline.
   // We need to have the data to support the right place.
   if (PTO.LoopFusion)

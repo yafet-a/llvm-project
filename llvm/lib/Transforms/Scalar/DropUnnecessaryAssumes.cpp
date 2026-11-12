@@ -80,10 +80,20 @@ DropUnnecessaryAssumesPass::run(Function &F, FunctionAnalysisManager &FAM) {
       unsigned NumBundles = Assume->getNumOperandBundles();
       for (unsigned I = 0; I != NumBundles; ++I) {
         auto IsDead = [&](OperandBundleUse Bundle) {
-          switch (getBundleAttrFromOBU(Bundle)) {
+          BundleAttr Attr = getBundleAttrFromOBU(Bundle);
+          if (OnlyArrayExtents)
+            return Attr == BundleAttr::ArrayExtents ||
+                   Attr == BundleAttr::ArrayStrides;
+          switch (Attr) {
           // "ignore" operand bundles are always dead.
           case BundleAttr::Ignore:
             return true;
+
+          // Array contracts are only dropped if requested (e.g., after loop
+          // interchange has run).
+          case BundleAttr::ArrayExtents:
+          case BundleAttr::ArrayStrides:
+            return false;
 
           // "dereferenceable" operand bundles are only dropped if requested
           // (e.g., after loop vectorization has run).
@@ -133,6 +143,9 @@ DropUnnecessaryAssumesPass::run(Function &F, FunctionAnalysisManager &FAM) {
       continue;
     }
 
+    if (OnlyArrayExtents)
+      continue;
+
     Value *Cond = Assume->getArgOperand(0);
     // Don't drop type tests, which have special semantics.
     if (match(Cond, m_Intrinsic<Intrinsic::type_test>()) ||
@@ -163,6 +176,8 @@ void DropUnnecessaryAssumesPass::printPipeline(
     raw_ostream &OS, function_ref<StringRef(StringRef)> MapClassName2PassName) {
   static_cast<PassInfoMixin<DropUnnecessaryAssumesPass> *>(this)->printPipeline(
       OS, MapClassName2PassName);
-  if (DropDereferenceable)
+  if (OnlyArrayExtents)
+    OS << "<array-extents-only>";
+  else if (DropDereferenceable)
     OS << "<drop-deref>";
 }

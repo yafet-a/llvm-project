@@ -104,6 +104,22 @@ define ptr @operand_bundle_one_live_one_dead(ptr %x, ptr %y) {
   ret ptr %y
 }
 
+; Array contracts are kept unless dropping them is requested, even though the
+; extent and stride values are otherwise ephemeral.
+define ptr @array_contract_ephemeral_shape(ptr %base, i64 %extent,
+                                           i64 %stride) {
+; CHECK-LABEL: define ptr @array_contract_ephemeral_shape(
+; CHECK-SAME: ptr [[BASE:%.*]], i64 [[EXTENT:%.*]], i64 [[STRIDE:%.*]]) {
+; CHECK-NEXT:    [[ACCESS:%.*]] = getelementptr nusw i8, ptr [[BASE]], i64 0
+; CHECK-NEXT:    call void @llvm.assume(i1 true) [ "array.extents"(ptr [[ACCESS]], ptr [[BASE]], i64 [[EXTENT]]), "array.strides"(ptr [[ACCESS]], i64 [[STRIDE]]) ]
+; CHECK-NEXT:    ret ptr [[ACCESS]]
+;
+  %access = getelementptr nusw i8, ptr %base, i64 0
+  call void @llvm.assume(i1 true) [ "array.extents"(ptr %access, ptr %base, i64 %extent),
+      "array.strides"(ptr %access, i64 %stride) ]
+  ret ptr %access
+}
+
 define i64 @operand_bundle_ignore_unaffected_operands(ptr %x, i64 %align) {
 ; CHECK-LABEL: define i64 @operand_bundle_ignore_unaffected_operands(
 ; CHECK-SAME: ptr [[X:%.*]], i64 [[ALIGN:%.*]]) {

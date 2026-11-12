@@ -25,6 +25,13 @@ class Instruction;
 class ScalarEvolution;
 class SCEV;
 
+/// Describes whether Sizes includes every declared dimension or omits an
+/// unknown outermost dimension inferred from a flattened access.
+enum class DelinearizationShapeKind {
+  UnknownOuterDimension,
+  Complete,
+};
+
 /// Compute the array dimensions Sizes from the set of Terms extracted from
 /// the memory access function of this SCEVAddRecExpr (second step of
 /// delinearization).
@@ -130,24 +137,55 @@ LLVM_ABI bool findFixedSizeArrayDimensions(ScalarEvolution &SE,
 /// 1. Compute the array size
 /// 2. Compute the access function: same as normal delinearization
 ///
-/// Different from the normal delinearization, this function assumes that NO
-/// terms exist in the \p Expr. In other words, it assumes that the all step
-/// values are constant.
+/// If \p CtxI is provided and an array.extents contract describes that exact
+/// access, the contract's shape is used directly and symbolic step values are
+/// supported. Otherwise, this function assumes that NO terms exist in the
+/// \p Expr. In other words, it assumes that the all step values are constant.
+///
+/// \p ShapeKind reports whether all dimensions came from a stated shape or
+/// whether the outermost dimension remains unknown.
+/// If \p CtxI is provided, a matching dominating array.extents carrier may
+/// validate the recovered inner dimensions and their in-range guarantee;
+/// \p UsesArrayExtents reports that case.
 ///
 /// This function is intended to replace getIndexExpressionsFromGEP. They rely
 /// on the GEP source element type so that will be removed in the future.
-LLVM_ABI bool
-delinearizeFixedSizeArray(ScalarEvolution &SE, const SCEV *Expr,
-                          SmallVectorImpl<const SCEV *> &Subscripts,
-                          SmallVectorImpl<const SCEV *> &Sizes,
-                          const SCEV *ElementSize);
+LLVM_ABI bool delinearizeFixedSizeArray(
+    ScalarEvolution &SE, const SCEV *Expr,
+    SmallVectorImpl<const SCEV *> &Subscripts,
+    SmallVectorImpl<const SCEV *> &Sizes, const SCEV *ElementSize,
+    DelinearizationShapeKind &ShapeKind, const Instruction *CtxI = nullptr,
+    bool *UsesArrayExtents = nullptr);
+
+/// Return whether a dominating array.extents contract for the base of \p Expr
+/// describes the inner dimensions recovered in \p Sizes. This permits the
+/// contract's in-range guarantee to be reused by parametric delinearization
+/// only when both paths agree on the mixed-radix shape.
+LLVM_ABI bool arrayExtentsDescribeDelinearization(ScalarEvolution &SE,
+                                                  const SCEV *Expr,
+                                                  ArrayRef<const SCEV *> Sizes,
+                                                  const SCEV *ElementSize,
+                                                  const Instruction *CtxI);
+
+/// Return whether the array.extents bundles describing \p Src and \p Dst prove
+/// that they address disjoint constant-size subobjects of one enclosing
+/// allocation.
+LLVM_ABI bool arrayExtentsProveDisjoint(ScalarEvolution &SE, Instruction *Src,
+                                        Instruction *Dst);
 
 /// Check that each subscript in \p Subscripts is within the corresponding size
 /// in \p Sizes. For the outermost dimension, the subscript being negative is
-/// allowed.
+/// allowed when \p ShapeKind says its size is unknown. If \p CtxI is provided,
+/// facts that dominate that instruction may be used to validate the
+/// subscripts. \p SubscriptsInRange may be set only when a matching
+/// array.extents carrier supplies that guarantee; the range and overflow checks
+/// are then skipped, since an in-range access to a valid array cannot wrap.
 LLVM_ABI bool validateDelinearizationResult(ScalarEvolution &SE,
                                             ArrayRef<const SCEV *> Sizes,
-                                            ArrayRef<const SCEV *> Subscripts);
+                                            ArrayRef<const SCEV *> Subscripts,
+                                            DelinearizationShapeKind ShapeKind,
+                                            const Instruction *CtxI = nullptr,
+                                            bool SubscriptsInRange = false);
 
 /// Gathers the individual index expressions from a GEP instruction.
 ///

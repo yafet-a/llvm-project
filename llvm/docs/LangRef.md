@@ -3315,6 +3315,30 @@ The following attributes are currently accepted:
     a power of two, the pointer value must be all-zero. Otherwise the behavior is
     undefined.
 
+`"array.extents"(ptr %base, i64 %extent0, ...)`
+:   Describes the shape of an array based at `%base`. There must be at least
+    one extent. Extents are listed in memory-layout order, fastest varying
+    dimension first, and are positive. A constant extent must therefore be
+    greater than zero.
+
+`"array.access"(ptr %access)`
+:   Optionally accompanies `"array.extents"` on the same assume and states that
+    the source-language subscripts used to form `%access` are in range for
+    those extents. This scopes the in-range guarantee to one element address;
+    the extent bundle remains a shape declaration for its base. The guarantee
+    does not apply to non-zero offsets derived from `%access`, even if
+    `%access` escapes to another function. An
+    `"array.access"` bundle separated from its extent bundle by an IR
+    transformation has no effect.
+
+`"array.strides"(ptr %base, i64 %stride0, ...)`
+:   Optionally accompanies `"array.extents"` on the same assume to describe
+    descriptor-provided byte strides. The base and number of dimensions must
+    match the extent bundle, and strides use the same fastest-varying-first
+    order. Consumers that require a contiguous mixed-radix layout must verify
+    that the strides agree with the extents before using the range guarantee.
+    An `"array.strides"` bundle without an extent bundle has no effect.
+
 `"cold"()`
 :   Equivalent to {ref}`cold <attr_cold>`.
 

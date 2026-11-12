@@ -3929,6 +3929,11 @@ Instruction *InstCombinerImpl::visitCallInst(CallInst &CI) {
       switch (getBundleAttrFromOBU(OBU)) {
       case BundleAttr::None:
         llvm_unreachable("Unexpected Attribute");
+      // The array shape and range contract is consumed by delinearization.
+      // Generic instcombine folds must preserve it.
+      case BundleAttr::ArrayExtents:
+      case BundleAttr::ArrayStrides:
+        break;
       case BundleAttr::Align: {
         // Try to remove redundant alignment assumptions.
         auto [Ptr, _, OffsetPtr, Alignment, Offset] = getAssumeAlignInfo(OBU);
